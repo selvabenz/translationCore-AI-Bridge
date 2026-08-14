@@ -366,13 +366,13 @@ class BridgeApp(tk.Tk):
         white bold selected tab so the active workspace is unmistakable at a glance.
         """
         ambient_bg = '#f0f0f0'  # SystemButtonFace on Windows; matches the notebook's own background
-        w, h, radius = 40, 32, 8
+        w, h, radius = 28, 22, 6
         self._tab_img_normal = self._rounded_tab_image(w, h, radius, '#e8eaed', ambient_bg)
         self._tab_img_hover = self._rounded_tab_image(w, h, radius, '#f1f3f4', ambient_bg)
         self._tab_img_selected = self._rounded_tab_image(w, h, radius, '#ffffff', ambient_bg)
 
-        style.configure('TNotebook', tabmargins=[2, 8, 2, 0], background=ambient_bg)
-        style.configure('TNotebook.Tab', padding=[18, 9], font=('Segoe UI', 10), foreground='#5f6368')
+        style.configure('TNotebook', tabmargins=[2, 4, 2, 0], background=ambient_bg)
+        style.configure('TNotebook.Tab', padding=[10, 4], font=('Segoe UI', 10), foreground='#5f6368')
         style.map('TNotebook.Tab',
                   foreground=[('selected', '#000000'), ('active', '#202124')],
                   font=[('selected', ('Segoe UI', 10, 'bold'))])
@@ -380,7 +380,7 @@ class BridgeApp(tk.Tk):
         style.element_create('Chrome.tab', 'image', self._tab_img_normal,
                               ('selected', self._tab_img_selected),
                               ('active', self._tab_img_hover),
-                              border=(10, 10, 10, 2), sticky='nsew')
+                              border=(7, 6, 7, 2), sticky='nsew')
 
         def substitute(layout):
             out = []
