@@ -1,0 +1,178 @@
+{
+  "translationCoreRoot": "<translationCore-root>",
+  "projects": [
+    {
+      "bookId": "oba",
+      "project": "Obadiah (oba) — Tamil",
+      "inventory": {
+        "project": "Obadiah (oba) — Tamil",
+        "project_path": "<translationCore-root>/projects/ta_ntb_oba_book",
+        "resources": {
+          "translationAcademy": {
+            "resource": "translationAcademy",
+            "version": "v87",
+            "provider": "unfoldingWord",
+            "path": "<translationCore-root>/resources/en/translationHelps/translationAcademy/v87_unfoldingWord",
+            "project_pinned": true,
+            "reason": "matched to Translation Notes v87"
+          },
+          "translationNotes": {
+            "resource": "translationNotes",
+            "version": "v87",
+            "provider": "unfoldingWord",
+            "path": "<translationCore-root>/resources/en/translationHelps/translationNotes/v87_unfoldingWord",
+            "project_pinned": true,
+            "reason": "project manifest tc_en_check_version_translationNotes"
+          },
+          "translationWords": {
+            "resource": "translationWords",
+            "version": "v87",
+            "provider": "unfoldingWord",
+            "path": "<translationCore-root>/resources/en/translationHelps/translationWords/v87_unfoldingWord",
+            "project_pinned": true,
+            "reason": "project manifest tc_en_check_version_translationWords"
+          },
+          "translationWordsLinks": {
+            "resource": "translationWordsLinks",
+            "version": "v87",
+            "provider": "unfoldingWord",
+            "path": "<translationCore-root>/resources/en/translationHelps/translationWordsLinks/v87_unfoldingWord",
+            "project_pinned": true,
+            "reason": "matched to Translation Words v87"
+          }
+        },
+        "original_language_versions": {
+          "tc_orig_lang_check_version_translationNotes": "2.1.30",
+          "tc_orig_lang_check_version_translationWords": "2.1.31",
+          "tc_orig_lang_check_version_wordAlignment": "2.1.31"
+        },
+        "target_language": {
+          "id": "ta",
+          "name": "Tamil",
+          "direction": "ltr",
+          "book": {
+            "name": "ஒபதியா"
+          }
+        }
+      },
+      "checks": 245,
+      "missingEvidence": []
+    },
+    {
+      "bookId": "psa",
+      "project": "Psalms (psa) — தமிழ்",
+      "inventory": {
+        "project": "Psalms (psa) — தமிழ்",
+        "project_path": "<translationCore-root>/projects/ta_ntb_psa_book",
+        "resources": {
+          "translationAcademy": {
+            "resource": "translationAcademy",
+            "version": "v87",
+            "provider": "unfoldingWord",
+            "path": "<translationCore-root>/resources/en/translationHelps/translationAcademy/v87_unfoldingWord",
+            "project_pinned": false,
+            "reason": "matched to Translation Notes v87"
+          },
+          "translationNotes": {
+            "resource": "translationNotes",
+            "version": "v87",
+            "provider": "unfoldingWord",
+            "path": "<translationCore-root>/resources/en/translationHelps/translationNotes/v87_unfoldingWord",
+            "project_pinned": false,
+            "reason": "latest compatible installed fallback"
+          },
+          "translationWords": {
+            "resource": "translationWords",
+            "version": "v87",
+            "provider": "unfoldingWord",
+            "path": "<translationCore-root>/resources/en/translationHelps/translationWords/v87_unfoldingWord",
+            "project_pinned": false,
+            "reason": "latest compatible installed fallback"
+          },
+          "translationWordsLinks": {
+            "resource": "translationWordsLinks",
+            "version": "v87",
+            "provider": "unfoldingWord",
+            "path": "<translationCore-root>/resources/en/translationHelps/translationWordsLinks/v87_unfoldingWord",
+            "project_pinned": false,
+            "reason": "matched to Translation Words v87"
+          }
+        },
+        "original_language_versions": {
+          "tc_orig_lang_check_version_wordAlignment": "2.1.32"
+        },
+        "target_language": {
+          "id": "ta",
+          "name": "தமிழ்",
+          "direction": "ltr",
+          "book": {
+            "name": "சங்கீதங்கள்"
+          }
+        }
+      },
+      "checks": 4583,
+      "missingEvidence": []
+    },
+    {
+      "bookId": "rut",
+      "project": "Ruth (rut) — Tamil",
+      "inventory": {
+        "project": "Ruth (rut) — Tamil",
+        "project_path": "<translationCore-root>/projects/ta_ntb_rut_book",
+        "resources": {
+          "translationAcademy": {
+            "resource": "translationAcademy",
+            "version": "v87",
+            "provider": "unfoldingWord",
+            "path": "<translationCore-root>/resources/en/translationHelps/translationAcademy/v87_unfoldingWord",
+            "project_pinned": true,
+            "reason": "matched to Translation Notes v87"
+          },
+          "translationNotes": {
+            "resource": "translationNotes",
+            "version": "v87",
+            "provider": "unfoldingWord",
+            "path": "<translationCore-root>/resources/en/translationHelps/translationNotes/v87_unfoldingWord",
+            "project_pinned": true,
+            "reason": "project manifest tc_en_check_version_translationNotes"
+          },
+          "translationWords": {
+            "resource": "translationWords",
+            "version": "v87",
+            "provider": "unfoldingWord",
+            "path": "<translationCore-root>/resources/en/translationHelps/translationWords/v87_unfoldingWord",
+            "project_pinned": true,
+            "reason": "project manifest tc_en_check_version_translationWords"
+          },
+          "translationWordsLinks": {
+            "resource": "translationWordsLinks",
+            "version": "v87",
+            "provider": "unfoldingWord",
+            "path": "<translationCore-root>/resources/en/translationHelps/translationWordsLinks/v87_unfoldingWord",
+            "project_pinned": true,
+            "reason": "matched to Translation Words v87"
+          }
+        },
+        "original_language_versions": {
+          "tc_orig_lang_check_version_translationNotes": "2.1.30",
+          "tc_orig_lang_check_version_wordAlignment": "2.1.31",
+          "tc_orig_lang_check_version_translationWords": "2.1.31"
+        },
+        "target_language": {
+          "id": "ta",
+          "name": "Tamil",
+          "direction": "ltr",
+          "book": {
+            "name": "ரூத்"
+          }
+        }
+      },
+      "checks": 559,
+      "missingEvidence": []
+    }
+  ],
+  "totals": {
+    "checks": 5387,
+    "missingEvidence": 0
+  }
+}

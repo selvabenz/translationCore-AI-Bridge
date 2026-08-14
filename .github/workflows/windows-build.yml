@@ -1,0 +1,80 @@
+name: Windows production certification build
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  certify-windows:
+    strategy:
+      matrix:
+        python: ['3.11','3.12']
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install dependencies
+        shell: pwsh
+        run: python -m pip install --upgrade -r requirements.txt pyinstaller
+      - name: Compile all Python sources
+        shell: pwsh
+        run: python -m compileall -q tc_ai_bridge tests
+      - name: Run portable production tests
+        shell: pwsh
+        run: python -m unittest discover -v
+      - name: Build desktop executable
+        if: matrix.python == '3.11'
+        shell: pwsh
+        run: >-
+          python -m PyInstaller --noconfirm --clean --windowed --onedir
+          --name "translationCore-AI-Bridge-v0.7.0"
+          --icon "assets/app_icon.ico"
+          --add-data "assets;assets"
+          --add-data "userguide;userguide"
+          launcher.pyw
+      - name: Verify packaged executable exists and icon/userguide assets shipped
+        if: matrix.python == '3.11'
+        shell: pwsh
+        run: |
+          if (!(Test-Path "dist/translationCore-AI-Bridge-v0.7.0/translationCore-AI-Bridge-v0.7.0.exe")) { throw "EXE missing" }
+          if (!(Test-Path "dist/translationCore-AI-Bridge-v0.7.0/_internal/assets/app_icon.ico")) { Write-Host "PyInstaller may have flattened assets; validating recursively"; if (!(Get-ChildItem dist -Recurse -Filter app_icon.ico)) { throw "Icon asset missing" } }
+          if (!(Get-ChildItem dist -Recurse -Filter index.html | Where-Object FullName -Like '*userguide*')) { throw "User guide missing" }
+      - name: Upload one-dir Windows app
+        if: matrix.python == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: translationCore-AI-Bridge-v0.7.0-windows-onedir
+          path: dist/translationCore-AI-Bridge-v0.7.0/
+  installer:
+    needs: certify-windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        shell: pwsh
+        run: python -m pip install --upgrade -r requirements.txt pyinstaller
+      - name: Build desktop executable
+        shell: pwsh
+        run: >-
+          python -m PyInstaller --noconfirm --clean --windowed --onedir
+          --name "translationCore-AI-Bridge-v0.7.0"
+          --icon "assets/app_icon.ico"
+          --add-data "assets;assets"
+          --add-data "userguide;userguide"
+          launcher.pyw
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+      - name: Build installer
+        shell: pwsh
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\translationCore-AI-Bridge.iss'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: translationCore-AI-Bridge-v0.7.0-setup
+          path: dist-installer/*.exe

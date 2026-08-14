@@ -1,0 +1,87 @@
+# ============================================================
+# Python virtual environments - ignore at ANY folder depth
+# ============================================================
+
+**/.venv/
+**/.venv/**
+**/.venv-build
+.venv-build\Scripts\
+**/.venv-icon/
+**/.venv-icon/**
+**/.venv-test/
+**/.venv-test/**
+**/.venv-cert/
+**/.venv-cert/**
+
+**/venv/
+**/venv/**
+**/env/
+**/env/**
+
+
+# ============================================================
+# Python cache - anywhere in repository
+# ============================================================
+
+**/__pycache__/
+**/__pycache__/**
+*.py[cod]
+*$py.class
+
+
+# ============================================================
+# PyInstaller / build output - anywhere in repository
+# ============================================================
+
+**/build/
+**/build/**
+**/dist/
+**/dist/**
+**/Output/
+**/Output/**
+**/output/
+**/output/**
+
+*.spec
+*.manifest
+
+
+# ============================================================
+# Local test / temporary output
+# ============================================================
+
+**/.pytest_cache/
+**/.pytest_cache/**
+**/.mypy_cache/
+**/.mypy_cache/**
+**/.cache/
+**/.cache/**
+
+**/tmp/
+**/tmp/**
+**/temp/
+**/temp/**
+
+
+# ============================================================
+# Generated local certification environments/data
+# ============================================================
+
+**/certification-output/
+**/certification-output/**
+**/translationCore-certification/
+**/translationCore-certification/**
+**/disposable-backend/
+**/disposable-backend/**
+
+
+# ============================================================
+# IDE / OS
+# ============================================================
+
+**/.vscode/
+**/.idea/
+
+.DS_Store
+Thumbs.db
+Desktop.ini
