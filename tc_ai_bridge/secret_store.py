@@ -63,10 +63,6 @@ class AppSettings:
             except Exception:
                 self.data = {}
 
-    def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self.data, indent=2), encoding='utf-8')
-
     def set_api_key(self, key: str, persist: bool = True) -> None:
         self.data.pop('api_key_dpapi', None)
         self.data['_session_api_key'] = key.strip()

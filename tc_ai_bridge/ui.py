@@ -151,10 +151,6 @@ class BridgeApp(tk.Tk):
         if small==self._small_screen and compact==self._compact_screen: return
         self._small_screen=small; self._compact_screen=compact
         try:
-            if small:
-                if self.sidebar.winfo_manager(): self.sidebar.pack_forget()
-            else:
-                if not self.sidebar.winfo_manager(): self.sidebar.pack(side='left',fill='y',padx=(0,8),before=self.content)
             # ttk.Panedwindow orientation is read-only after creation. On compact screens
             # keep Hebrew/Tamil side-by-side and move a mirrored Current Alignment Groups viewer
             # below them. Groups must remain visible rather than disappearing on small screens.
@@ -345,6 +341,60 @@ class BridgeApp(tk.Tk):
                 walk(child)
         walk(self)
 
+    @staticmethod
+    def _rounded_tab_image(w: int, h: int, radius: int, fill: str, cut: str) -> tk.PhotoImage:
+        """Procedurally draw a tab background with rounded top corners (no PIL dependency).
+
+        Corner pixels are filled with `cut` (the ambient window background), which fakes
+        transparency since Tk's PhotoImage has no cheap per-pixel alpha compositing here.
+        """
+        img = tk.PhotoImage(width=w, height=h)
+        img.put(cut, to=(0, 0, w, h))
+        for y in range(h):
+            if y < radius:
+                dy = radius - y
+                dx = radius - int(round((radius * radius - dy * dy) ** 0.5))
+            else:
+                dx = 0
+            x0, x1 = dx, w - dx
+            if x1 > x0:
+                img.put(fill, to=(x0, y, x1, y + 1))
+        return img
+
+    def _style_chrome_tabs(self, style: ttk.Style) -> None:
+        """Chrome-style tab strip: rounded top corners, gray/receding unselected tabs, a
+        white bold selected tab so the active workspace is unmistakable at a glance.
+        """
+        ambient_bg = '#f0f0f0'  # SystemButtonFace on Windows; matches the notebook's own background
+        w, h, radius = 40, 32, 8
+        self._tab_img_normal = self._rounded_tab_image(w, h, radius, '#e8eaed', ambient_bg)
+        self._tab_img_hover = self._rounded_tab_image(w, h, radius, '#f1f3f4', ambient_bg)
+        self._tab_img_selected = self._rounded_tab_image(w, h, radius, '#ffffff', ambient_bg)
+
+        style.configure('TNotebook', tabmargins=[2, 8, 2, 0], background=ambient_bg)
+        style.configure('TNotebook.Tab', padding=[18, 9], font=('Segoe UI', 10), foreground='#5f6368')
+        style.map('TNotebook.Tab',
+                  foreground=[('selected', '#000000'), ('active', '#202124')],
+                  font=[('selected', ('Segoe UI', 10, 'bold'))])
+
+        style.element_create('Chrome.tab', 'image', self._tab_img_normal,
+                              ('selected', self._tab_img_selected),
+                              ('active', self._tab_img_hover),
+                              border=(10, 10, 10, 2), sticky='nsew')
+
+        def substitute(layout):
+            out = []
+            for name, opts in layout:
+                opts = dict(opts)
+                if name == 'Notebook.tab':
+                    name = 'Chrome.tab'
+                if 'children' in opts:
+                    opts['children'] = substitute(opts['children'])
+                out.append((name, opts))
+            return out
+
+        style.layout('TNotebook.Tab', substitute(style.layout('TNotebook.Tab')))
+
     def _build_ui(self):
         style = ttk.Style(self)
         try:
@@ -356,6 +406,7 @@ class BridgeApp(tk.Tk):
         style.configure('Accent.TButton', font=('Segoe UI', 9, 'bold'))
         style.configure('Status.TLabel', font=('Segoe UI', 9))
         style.configure('Metric.TLabel', font=('Segoe UI', 9, 'bold'))
+        self._style_chrome_tabs(style)
 
         # Compact responsive header. The old screenshot-like product title is intentionally
         # removed from the client area; Windows still shows the real window title + app icon.
@@ -377,6 +428,7 @@ class BridgeApp(tk.Tk):
         self.api_status_var=tk.StringVar(value='API not tested')
         self.api_status_label=ttk.Label(self.api_box,textvariable=self.api_status_var); self.api_status_label.grid(row=0,column=1,sticky='e')
         self.api_test_btn=ttk.Button(self.api_box,text='Test API',command=self._test_api_connection); self.api_test_btn.grid(row=1,column=1,sticky='e',pady=(2,0))
+        ttk.Button(self.api_box,text='User Guide',command=self._open_user_guide).grid(row=0,column=2,rowspan=2,sticky='e',padx=(8,0))
         self._set_api_indicator('unknown','API not tested')
 
         self.project_var=tk.StringVar(); self.chapter_var=tk.StringVar(); self.verse_var=tk.StringVar()
@@ -391,19 +443,13 @@ class BridgeApp(tk.Tk):
         self.header.columnconfigure(2,weight=1)
 
         self.body=ttk.Frame(self,padding=(8,0,8,4)); self.body.pack(fill='both',expand=True)
-        self.sidebar=ttk.Frame(self.body,padding=(4,6)); self.sidebar.pack(side='left',fill='y',padx=(0,8))
-        ttk.Label(self.sidebar,text='WORKSPACE',style='Section.TLabel').pack(anchor='w',pady=(0,5))
         self.content=ttk.Frame(self.body); self.content.pack(side='left',fill='both',expand=True)
         self.notebook=ttk.Notebook(self.content); self.notebook.pack(fill='both',expand=True)
         self.dashboard_tab=ttk.Frame(self.notebook); self.align_tab=ttk.Frame(self.notebook); self.review_tab=ttk.Frame(self.notebook); self.qa_tab=ttk.Frame(self.notebook); self.tc_tab=ttk.Frame(self.notebook); self.kb_tab=ttk.Frame(self.notebook); self.term_tab=ttk.Frame(self.notebook); self.psalms_tab=ttk.Frame(self.notebook); self.production_tab=ttk.Frame(self.notebook); self.settings_tab=ttk.Frame(self.notebook)
-        tabs=[('Dashboard',self.dashboard_tab),('Alignment',self.align_tab),('AI Final Review',self.review_tab),('Quality Queue',self.qa_tab),('tC Check State',self.tc_tab),('Knowledge Base',self.kb_tab),('Terminology',self.term_tab),('Psalms QA',self.psalms_tab),('Production',self.production_tab),('Settings & Log',self.settings_tab)]
+        tabs=[('Dashboard',self.dashboard_tab),('tN tW',self.review_tab),('Alignment',self.align_tab),('Quality Queue',self.qa_tab),('tC Check State',self.tc_tab),('Knowledge Base',self.kb_tab),('Terminology',self.term_tab),('Psalms QA',self.psalms_tab),('Production',self.production_tab),('Settings & Log',self.settings_tab)]
         self._tab_defs=tabs
-        self._compact_tab_labels=['Dash','Align','AI Review','QA','tC','KB','Terms','Psalms','Prod','Settings']
+        self._compact_tab_labels=['Dash','tN tW','Align','QA','tC','KB','Terms','Psalms','Prod','Settings']
         for label,tab in tabs: self.notebook.add(tab,text=label)
-        for label,tab in tabs:
-            ttk.Button(self.sidebar,text=label,width=18,command=lambda t=tab:self.notebook.select(t)).pack(fill='x',pady=2)
-        ttk.Separator(self.sidebar,orient='horizontal').pack(fill='x',pady=10)
-        ttk.Button(self.sidebar,text='User Guide',width=18,command=self._open_user_guide).pack(fill='x')
 
         self._build_dashboard_tab(); self._build_alignment_tab(); self._build_review_tab(); self._build_qa_tab(); self._build_tc_tab(); self._build_kb_tab(); self._build_terminology_tab(); self._build_psalms_tab(); self._build_production_tab(); self._build_settings_tab()
 
@@ -434,7 +480,7 @@ class BridgeApp(tk.Tk):
     def _build_dashboard_tab(self):
         outer = ttk.Frame(self.dashboard_tab, padding=10); outer.pack(fill='both', expand=True)
         title = ttk.Frame(outer); title.pack(fill='x')
-        ttk.Label(title, text='Project Analysis & Exception-First Review', font=('Segoe UI', 13, 'bold')).pack(side='left')
+        ttk.Label(title, text='Project Analysis & Exception-First Review', font=('Segoe UI', 10, 'bold')).pack(side='left')
         ttk.Button(title, text='Refresh Project Scan', command=self._refresh_dashboard_background).pack(side='right')
         self.dashboard_summary_var = tk.StringVar(value='Load a project to scan existing translationCore work.')
         self.dashboard_summary_label=ttk.Label(outer, textvariable=self.dashboard_summary_var, wraplength=1250); self.dashboard_summary_label.pack(fill='x', anchor='w', pady=(5,8))
