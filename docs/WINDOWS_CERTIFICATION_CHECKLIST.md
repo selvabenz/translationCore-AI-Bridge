@@ -1,13 +1,6 @@
-# Windows Production Certification Checklist — v0.7.0
+# Windows Certification Checklist — v0.7.4
 
-## Prerequisites
-
-- [ ] Windows 10/11 64-bit.
-- [ ] Python 3.11 or 3.12 (Python 3.12 recommended for source certification).
-- [ ] `diagnose_windows.bat` reports Bridge 0.7.0 and a working Tk import.
-- [ ] The translationCore data root contains `projects` and `resources`.
-
-## Disposable-path safety gate
+## A. Source/runtime regression
 
 Run:
 
@@ -15,42 +8,125 @@ Run:
 certify_windows.bat "C:\Users\Benz\translationCore"
 ```
 
-Before tests begin, confirm:
+Expected discovery/result when all tests pass:
 
 ```text
-LIVE PROJECTS:         C:\Users\Benz\translationCore
-DISPOSABLE TEST COPY:  C:\Users\Benz\AppData\Local\Temp\tc_ai_bridge_v070_cert_...\translationCore
+WINDOWS CERTIFICATION RESULT: 152/152 TESTS PASSED
+  Core/data tests: 118/118
+  Isolated Tk GUI tests: 34/34
 ```
 
-Stop immediately if the disposable path is blank, equals the application directory, equals the live translationCore root, or is inside either one. The Python fixture should also issue `SAFETY REFUSAL` for such paths.
+The certifier must report that write-capable translationCore tests use only the disposable clone.
 
-## Regression gate
+## B. Paratext connector diagnostics
 
-v0.7.0 runs core/data tests first and then each real-Tk GUI test in a fresh Python process. Any GUI process crash or 90-second timeout fails certification.
+With Paratext installed, run:
 
-Expected final summary for this release:
+```bat
+diagnose_paratext_connector.bat
+```
+
+Confirm:
+
+- Paratext installation found;
+- version reports 9.5.110.1 for the targeted first certification;
+- PluginInterfaces assembly found;
+- Windows .NET Framework C# compiler found.
+
+## C. Build/install connector
+
+1. Close Paratext completely.
+2. Run:
+
+```bat
+install_paratext_connector.bat
+```
+
+3. Confirm `PARATEXT CONNECTOR INSTALLED`.
+4. Confirm the installed file exists under:
 
 ```text
-WINDOWS CERTIFICATION RESULT: 99/99 TESTS PASSED
-  Core/data tests: 75/75
-  Isolated Tk GUI tests: 24/24
+<Paratext>\plugins\translationCoreAIBridge\translationCoreAIBridge.ptxplg
 ```
 
-- [ ] No `FAIL`, `ERROR`, `Tcl_AsyncDelete`, or child-process timeout.
-- [ ] Certification cleanup removes the disposable root/junction.
-- [ ] `inspect_companion_windows.bat` after certification shows no certification-created changes in live project companion state.
+## D. Paratext load
 
-## Application smoke gate
+1. Start Paratext.
+2. Open the target Scripture project.
+3. Put the Scripture window in scroll/sync group A.
+4. Start the Bridge.
+5. Production → Paratext → Connect / Refresh.
 
-- [ ] Start with `run_windows.bat`.
-- [ ] Load the live translationCore root.
-- [ ] Test API and confirm green connected indicator.
-- [ ] Check one verse Alignment and Full Verse Review.
-- [ ] Check chapter Batch progress/summary.
-- [ ] Resize down to 760×560 and confirm progress, token/cost and toolbars remain visible.
-- [ ] Drag AI Proposal divider to both extremes; toolbar remains visible.
-- [ ] Close/reopen repeatedly without Tk/Tcl cleanup errors.
+Expected:
 
-## Packaged EXE/installer gate
+```text
+● Connected
+Paratext 9.5.110.1
+Connector 0.7.4
+actual Paratext user
+active project
+current reference
+Group A
+```
 
-The exact PyInstaller/Inno Setup artifacts must separately be installed and executed on Windows before labeling the binary itself production-certified.
+## E. Project binding safety
+
+1. Click **Verify / Bind Project** and confirm `Bound ✓`.
+2. Switch Paratext to a different project.
+3. Refresh.
+4. Confirm Bridge shows `PROJECT MISMATCH`.
+5. Confirm live note/navigation action is blocked.
+6. Return to the bound Paratext project.
+
+## F. Two-way verse navigation
+
+Enable **Sync verse navigation**.
+
+- Bridge GEN 1:1 → GEN 1:2: Paratext follows.
+- Paratext GEN 1:2 → GEN 1:3: Bridge follows.
+- Repeat rapidly between two verses and confirm no navigation loop.
+- Change Bridge project/book to another explicitly bound book and confirm correct Paratext navigation.
+
+## G. Selected-text Project Note
+
+1. Select an exact Tamil phrase in Paratext.
+2. Connect / Refresh and confirm Bridge displays the exact selection.
+3. Sync Notes.
+4. Confirm the note marker appears on that exact text.
+5. Confirm note author is the actual Paratext user and content identifies `[AI Suggestion]` when sent as AI-originated content.
+
+### Repeated-word edge case
+
+Choose a verse where the same Tamil word occurs twice.
+
+- With the exact occurrence selected in Paratext, note must attach to that occurrence.
+- Without a resolvable exact occurrence/context, Bridge must fail instead of attaching to the wrong word.
+
+## H. Reviewer-decision forwarding
+
+Enable **Auto-send review notes**.
+
+- Needs Discussion: local Bridge decision saves first, then a Paratext note is created.
+- Reject AI: same.
+- Disconnect/close Paratext and repeat: local Bridge decision must still save; live-note failure must not erase it.
+
+## I. Scripture-write boundary
+
+Verify normal Paratext Scripture text does not change during:
+
+- Connect / Refresh;
+- navigation sync;
+- selected-text note creation;
+- Needs Discussion/Reject forwarding.
+
+The connector exposes Project Notes only; any Scripture change is a certification failure.
+
+## J. Packaged EXE/installer
+
+After source/connector testing:
+
+```bat
+build_windows_installer.bat
+```
+
+Install the Setup EXE on a clean Windows test machine. Confirm the Start menu includes connector install/uninstall actions and the packaged Bridge can connect after the plugin is installed into Paratext.

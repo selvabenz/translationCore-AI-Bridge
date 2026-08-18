@@ -155,22 +155,75 @@ class MockAITests(unittest.TestCase):
 
     @unittest.skipUnless(REAL_ROOT.exists(), 'real uploaded translationCore backend not present')
     def test_mock_ai_alignment_end_to_end_on_real_obadiah(self):
+        """Exercise the v0.7.3+ gap-fill path without assuming Obadiah is untouched.
+
+        A real user's project may be fresh, partial, or fully aligned. The certification test must
+        therefore derive its mock link from the unresolved IDs actually sent to AI and must verify
+        preservation/no-token-loss rather than assuming ``wordBank`` is non-empty.
+        """
         p={x.book_id:x for x in TranslationCoreRoot(REAL_ROOT).projects()}['oba']
         a=p.load_verse_alignment('1','1')
+        before=make_inventory(a)
+        before_top={x.signature for x in before.top}
+        before_bottom={x.signature for x in before.bottom}
+        protected_before=[
+            ({x.signature for x in g.top_words},{x.signature for x in g.bottom_words})
+            for g in a.alignments if g.top_words and g.bottom_words
+        ]
+        chosen={'top_id':None,'bottom_id':None}
+
         def transport(url,headers,body,timeout):
             request=json.loads(body.decode('utf8'))
             sent=json.loads(request['input'])
-            self.assertTrue(sent['hebrew_topWords']); self.assertTrue(sent['tamil_bottomWords'])
-            result={'groups':[{'top_ids':['H001'],'bottom_ids':['T001'],'confidence':0.93,'reason':'mock semantic match'}],'review_notes':['review remaining tokens']}
+            self.assertTrue(sent['source_tokens_to_consider']); self.assertTrue(sent['target_tokens_to_consider'])
+            unresolved_top=list(sent.get('unresolved_source_ids') or [])
+            unresolved_bottom=list(sent.get('unresolved_target_ids') or [])
+            links=[]
+            if unresolved_top and unresolved_bottom:
+                chosen['top_id']=unresolved_top[0]; chosen['bottom_id']=unresolved_bottom[0]
+                links=[{'top_id':chosen['top_id'],'bottom_id':chosen['bottom_id'],'confidence':0.93,'reason':'mock semantic match'}]
+            result={
+                'links':links,
+                'implicit_top_ids':[],
+                'target_only_ids':[],
+                'review_notes':['review remaining tokens'],
+            }
             response={'output':[{'content':[{'type':'output_text','text':json.dumps(result)}]}],'usage':{'total_tokens':44}}
             return 200,json.dumps(response).encode()
+
         c=OpenAIResponsesClient('fake','gpt-test',transport=transport)
         proposal=c.propose_alignment(p,'1','1',a)
         validate_proposal(a,proposal)
         applied=apply_proposal(a,proposal)
-        self.assertEqual(applied.alignments[0].top_words[0].word,make_inventory(a).top[0].word)
-        self.assertEqual(applied.alignments[0].bottom_words[0].word,make_inventory(a).bottom[0].word)
-        self.assertGreater(len(applied.word_bank),0)
+        after=make_inventory(applied)
+
+        # The end-to-end mock may fill a gap, or on a completed verse it may correctly do nothing.
+        # Either way every real source and target token must survive the proposal round-trip.
+        self.assertEqual(before_top,{x.signature for x in after.top})
+        self.assertEqual(before_bottom,{x.signature for x in after.bottom})
+
+        # Existing non-empty project groups are protected evidence in gap-fill mode.
+        applied_groups=[
+            ({x.signature for x in g.top_words},{x.signature for x in g.bottom_words})
+            for g in applied.alignments if g.top_words and g.bottom_words
+        ]
+        for top_sigs,bottom_sigs in protected_before:
+            self.assertTrue(
+                any(top_sigs.issubset(pt) and bottom_sigs.issubset(pb) for pt,pb in applied_groups),
+                'gap-fill mock must preserve every established project alignment',
+            )
+
+        # If the real verse had an unresolved source+target pair, the mock link should be present.
+        if chosen['top_id'] and chosen['bottom_id']:
+            top_sig=before.top_ids[chosen['top_id']].signature
+            bottom_sig=before.bottom_ids[chosen['bottom_id']].signature
+            self.assertTrue(any(top_sig in pt and bottom_sig in pb for pt,pb in applied_groups))
+        else:
+            # A fully aligned/protected real verse is also a valid certification fixture.
+            self.assertEqual(
+                {x.signature for x in a.word_bank},
+                {x.signature for x in applied.word_bank},
+            )
 
     @unittest.skipUnless(REAL_ROOT.exists(), 'real uploaded translationCore backend not present')
     def test_mock_ai_quality_end_to_end_on_real_ruth(self):

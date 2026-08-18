@@ -16,7 +16,8 @@ from .usfm import whitespace_tokens
 
 from .models import VerseAlignment
 from .transaction_journal import TransactionJournal
-from .paratext_notes import append_paratext_note, validate_notes_11
+from .paratext_notes import append_paratext_note, validate_notes_11, convert_comment_list_to_notes_11, convert_legacy_notes_11, EXTERNAL_NOTE_SOURCE
+from .alignment_reliability import structural_issues, alignment_fingerprint
 
 
 class ProjectError(RuntimeError):
@@ -395,6 +396,102 @@ class TranslationCoreProject:
             result['humanDecisions'][key] += 1
         return result
 
+    def alignment_lock_state(self, chapter: str | int, verse: str | int) -> str:
+        """Classify existing work for v0.7.4 without rewriting it."""
+        alignment = self.load_verse_alignment(chapter, verse)
+        review = self.load_review_state(chapter, verse) or {}
+        if str(review.get('status', '')).lower() in ('approved', 'human_approved'):
+            return 'HARD_LOCK'
+        state = self._alignment_work_state(alignment)
+        if state == 'complete' or self.word_alignment_state(chapter, verse) == 'completed':
+            return 'PROTECTED_LEGACY'
+        if state == 'partial':
+            return 'PARTIAL_PROTECTED'
+        return 'OPEN'
+
+    def alignment_compatibility_scan(self) -> dict[str, Any]:
+        """Read-only v0.7.4 compatibility scan for existing alignment work."""
+        result: dict[str, Any] = {
+            'bookId': self.book_id,
+            'verses': 0,
+            'hardLocked': 0,
+            'protectedLegacy': 0,
+            'partialProtected': 0,
+            'open': 0,
+            'stale': 0,
+            'structuralReview': 0,
+            'malformed': 0,
+            'exceptions': [],
+            'filesModified': 0,
+        }
+        for ch in self.chapters():
+            for vs in self.verses(ch):
+                if str(vs) == 'front':
+                    continue
+                result['verses'] += 1
+                try:
+                    alignment = self.load_verse_alignment(ch, vs)
+                    issues = structural_issues(alignment)
+                    lock = self.alignment_lock_state(ch, vs)
+                    if lock == 'HARD_LOCK': result['hardLocked'] += 1
+                    elif lock == 'PROTECTED_LEGACY': result['protectedLegacy'] += 1
+                    elif lock == 'PARTIAL_PROTECTED': result['partialProtected'] += 1
+                    else: result['open'] += 1
+                    stale = self.word_alignment_state(ch, vs) == 'invalid'
+                    if stale:
+                        result['stale'] += 1
+                    if issues:
+                        result['structuralReview'] += 1
+                    if stale or issues:
+                        result['exceptions'].append({
+                            'chapter': str(ch), 'verse': str(vs), 'lock': lock,
+                            'stale': stale, 'issues': issues,
+                        })
+                except Exception as exc:
+                    result['malformed'] += 1
+                    result['exceptions'].append({
+                        'chapter': str(ch), 'verse': str(vs), 'lock': 'UNKNOWN',
+                        'stale': False, 'issues': [str(exc)],
+                    })
+        return result
+
+    def ensure_v073_migration_snapshot(self) -> Path:
+        """Create a hash-only compatibility snapshot; never rewrites alignment/project data."""
+        root = self.companion_dir() / 'migration' / 'pre-v073'
+        path = root / f'{self.book_id}.json'
+        if path.exists():
+            return path
+        chapters: dict[str, Any] = {}
+        for ch in self.chapters():
+            cp = self.chapter_path(ch)
+            try:
+                raw = cp.read_bytes()
+                chapters[str(ch)] = {'sha256': hashlib.sha256(raw).hexdigest(), 'bytes': len(raw)}
+            except Exception as exc:
+                chapters[str(ch)] = {'error': str(exc)}
+        data = {
+            'bookId': self.book_id,
+            'projectPath': str(self.path),
+            'createdTimestamp': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+            'purpose': 'v0.7.4 existing-work protection snapshot; hashes only; no project data rewritten',
+            'chapters': chapters,
+        }
+        _write_json_atomic(path, data)
+        return path
+
+    def record_alignment_diagnostic(self, chapter: str | int, verse: str | int, payload: dict[str, Any]) -> Path:
+        """Persist non-secret compiler diagnostics for field reliability analysis."""
+        iso = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+        safe = iso.replace(':', '_').replace('.', '_')
+        data = {
+            'bookId': self.book_id, 'chapter': str(chapter), 'verse': str(verse),
+            'timestamp': iso, 'app': 'translationCore AI Bridge', 'schemaVersion': 1,
+            **copy.deepcopy(payload),
+        }
+        path = self.companion_dir() / 'alignmentDiagnostics' / self.book_id / str(chapter) / str(verse) / f'{safe}.json'
+        _write_json_atomic(path, data)
+        return path
+
     def recover_incomplete_transactions(self) -> list[dict[str, Any]]:
         """Roll back any transaction left unfinished by a prior crash/power loss."""
         out = self.journal.recover_all()
@@ -443,28 +540,88 @@ class TranslationCoreProject:
         return path
 
 
-    def record_paratext_note(self, chapter: str | int, verse: str | int, text: str, username: str = 'AI Bridge Reviewer', selected_text: str = '', note_type: str = 'AI Bridge Review', metadata: dict[str, Any] | None = None) -> Path:
-        """Record a reviewer comment in Paratext Notes 1.1-compatible XML.
+    def _target_language_code(self) -> str:
+        target = self.manifest.get('target_language') if isinstance(self.manifest, dict) else None
+        if isinstance(target, dict):
+            value = target.get('id') or target.get('language_id') or target.get('identifier')
+            if value:
+                return str(value).strip()
+        for key in ('target_language_id', 'language_id', 'languageId'):
+            value = self.manifest.get(key) if isinstance(self.manifest, dict) else None
+            if value:
+                return str(value).strip()
+        return 'und'
 
-        Stored as companion data so Scripture is never polluted with note markers. The XML can be
-        exchanged/imported or posted by a future authenticated Paratext connector.
+    def _legacy_paratext_notes_path(self) -> Path:
+        return self.companion_dir() / 'paratextNotes' / f'{self.book_id}.notes.xml'
+
+    def _legacy_paratext_commentlist_path(self) -> Path:
+        return self.companion_dir() / 'paratextNotes' / f'{self.book_id}.comments.xml'
+
+    def record_paratext_note(self, chapter: str | int, verse: str | int, text: str, username: str = 'AI Bridge Reviewer', selected_text: str = '', note_type: str = '', metadata: dict[str, Any] | None = None, assigned_user: str = '', reply_to_user: str = '', ext_user: str = EXTERNAL_NOTE_SOURCE) -> Path:
+        """Record an API-ready Paratext Notes 1.1 project note.
+
+        ``username`` is stored as the best-known Paratext author hint in the companion XML. Live
+        Plugin API synchronization does not impersonate that value: Paratext itself records the
+        current logged-in Paratext user as the real Project Note author. API-ready XML export also
+        normalizes ``comment@user`` to a real detected/configured Paratext member. ``ext_user``
+        identifies the external AI origin. The target Scripture text is never modified by note
+        creation.
         """
-        path = self.companion_dir() / 'paratextNotes' / f'{self.book_id}.notes.xml'
+        path = self.paratext_notes_path()
+        old_commentlist = self._legacy_paratext_commentlist_path()
+        old_notes = self._legacy_paratext_notes_path()
+
+        # Upgrade existing companion data once. v0.7.1 wrote CommentList exports; v0.7.0 wrote
+        # Notes 1.1. Preserve the old files and create the corrected primary Notes file.
+        if not path.exists():
+            if old_commentlist.exists():
+                convert_comment_list_to_notes_11(old_commentlist, path, ext_user=ext_user)
+            elif old_notes.exists():
+                convert_legacy_notes_11(old_notes, path, language=self._target_language_code())
+
         tx = self.journal.begin('paratextNote', [path]); self.journal.mark_writing(tx)
         try:
             out, thread_id = append_paratext_note(
                 path, book_id=self.book_id, chapter=chapter, verse=verse,
                 verse_text=self.target_verse_text(chapter, verse), comment_text=text, reviewer=username,
-                selected_text=selected_text, note_type=note_type, metadata=metadata,
+                selected_text=selected_text, language=self._target_language_code(), note_type=str((metadata or {}).get('paratextThreadType') or ''),
+                assigned_user=assigned_user, reply_to_user=reply_to_user, metadata=metadata, ext_user=ext_user,
             )
             check = validate_notes_11(out)
-            self.journal.commit(tx, {'operation': 'paratextNote', 'threadId': thread_id, 'threads': check['threads']})
+            self.journal.commit(tx, {'operation': 'paratextNotes11', 'threadId': thread_id, 'threads': check['threads'], 'comments': check['comments']})
             return out
         except Exception as e:
             self.journal.rollback(tx, str(e)); raise
 
     def paratext_notes_path(self) -> Path:
-        return self.companion_dir() / 'paratextNotes' / f'{self.book_id}.notes.xml'
+        # This is a Bridge companion/export filename only. Direct Paratext synchronization uses
+        # the project GUID + Notes 1.1 API and does not depend on a guessed Paratext project file.
+        return self.companion_dir() / 'paratextNotes' / 'Notes_AI_Suggestion.xml'
+
+    def paratext_note_sync_state_path(self) -> Path:
+        return self.companion_dir() / 'paratextNotes' / 'live_sync_state.json'
+
+    def load_paratext_note_sync_state(self) -> dict[str, Any]:
+        path = self.paratext_note_sync_state_path()
+        if not path.exists():
+            return {'version': 1, 'items': {}}
+        try:
+            data = _read_json(path)
+        except Exception:
+            return {'version': 1, 'items': {}}
+        if not isinstance(data, dict):
+            return {'version': 1, 'items': {}}
+        items = data.get('items')
+        if not isinstance(items, dict):
+            items = {}
+        return {'version': 1, 'items': dict(items)}
+
+    def save_paratext_note_sync_state(self, data: dict[str, Any]) -> Path:
+        path = self.paratext_note_sync_state_path()
+        payload = {'version': 1, 'items': dict((data or {}).get('items') or {})}
+        _write_json_atomic(path, payload)
+        return path
 
     def comments_for_check(self, chapter: str | int, verse: str | int, check_id: str) -> list[dict[str, Any]]:
         out=[]

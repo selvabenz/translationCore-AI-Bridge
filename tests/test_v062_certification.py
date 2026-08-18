@@ -74,7 +74,7 @@ class CertificationIsolationPatchTests(unittest.TestCase):
             (project/'keep.txt').write_text('LIVE',encoding='utf-8')
             (source/'resources').mkdir()
             (source/'resources'/'resource.txt').write_text('RESOURCE',encoding='utf-8')
-            cert_parent=base/'tc_ai_bridge_v070_cert_123_456'
+            cert_parent=base/'tc_ai_bridge_v073_cert_123_456'
             dest=cert_parent/'translationCore'
             cp=subprocess.run([sys.executable,str(ROOT/'tests'/'certification_fixture.py'),str(source),str(dest)],capture_output=True,text=True)
             self.assertEqual(cp.returncode,0,cp.stdout+cp.stderr)

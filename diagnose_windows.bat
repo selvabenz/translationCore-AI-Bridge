@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 set "PYTHONHOME="
 set "PYTHONPATH="
-echo translationCore AI Bridge v0.7.0 Windows diagnostics
+echo translationCore AI Bridge v0.7.5 Windows diagnostics
 echo =====================================================
 echo Current folder: %CD%
 echo.

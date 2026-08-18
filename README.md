@@ -1,130 +1,196 @@
-# translationCore AI Bridge v0.7.0 — Reviewer Precision & Language-Aware Workflow
+# translationCore AI Bridge v0.7.5 — Logos Navigation + Responsive UX
 
-Windows desktop companion for translationCore projects. AI performs repetitive resource retrieval, source-language analysis, alignment preparation, Translation Notes/Words target selection, terminology comparison and first-pass QA; human reviewers remain authoritative for Scripture edits, check approval, terminology and final approval.
+Windows desktop companion for translationCore Bible translation projects. The Bridge combines deterministic translationCore-compatible data handling with AI-assisted alignment, Translation Notes/Words review, QA, terminology and evidence gathering while keeping the reviewer as final authority.
 
-## v0.7.0 focus
+## v0.7.5 focus
 
-This release is intentionally about **reviewer throughput, precision and language awareness** rather than adding another large group of checking tools.
-
-### 1. Reviewer speed
-- F5 runs AI Full Verse Review.
-- F8 opens the next highest-priority exception, then falls back to the next verse.
-- Ctrl+Enter accepts the selected AI check result.
-- Ctrl+Shift+D records Needs Discussion.
-- Ctrl+Shift+R rejects the selected AI conclusion.
-- Ctrl+Shift+Right moves to the next verse.
-- Optional **Auto-advance** moves to the next priority item after a human decision.
-- Changed-only chapter review and the project-wide exception queue remain the default fast path.
-
-### 2. AI accuracy / false-positive reduction
-A deterministic post-AI review gate now:
-- suppresses very low-confidence findings from the main reviewer queue;
-- downgrades Critical/High claims that do not meet confidence/evidence thresholds;
-- removes duplicate findings for the same underlying problem;
-- turns uncertain TN/TW pass/problem claims into `review` rather than overstating certainty;
-- keeps suppressed findings in the saved AI review for audit rather than deleting them.
-
-The model prompt also requires the strongest reasonable target-language explanation to be considered before reporting omission/addition/error, and asks the model not to repeat one issue under multiple labels.
-
-### 3. UI friction / overflow
-- Review, QA and alignment toolbars reflow on narrow windows.
-- Important text viewers have vertical and/or horizontal scrolling according to their content.
-- Long evidence, logs, Knowledge Base content, terminology analytics, Psalms QA, Git diff, privacy manifests and token/group lists can be fully inspected without truncation.
-- The TN/TW selection editor and terminology editor now have scrollable fields too.
-- Shift+mouse-wheel and horizontal navigation are supported where relevant.
-
-### 4. Language/plugin architecture
-The active project is inspected at runtime. The target language is resolved primarily from project/manifest metadata and secondarily from Unicode script evidence. The source language is detected from source tokens (Hebrew/Greek) with canon fallback.
-
-Bundled target plugins include Tamil, Hindi, Malayalam, Telugu, Kannada, Gujarati, Bengali and Punjabi plus a safe generic plugin. The detected plugin controls:
-- source/target labels and fonts;
-- language-specific QA categories;
-- prompt guidance;
-- alignment/review terminology;
-- target-language editorial checks.
-
-Tamil-specific Sandhi/word-joining checks are therefore not blindly applied to a Hindi, Malayalam or other project.
-
-### 5. Paratext-compatible reviewer notes
-Reviewer comments associated with AI/tC review decisions can also be written as **Paratext Notes 1.1-compatible XML** under the companion area:
+v0.7.5 builds on the stable v0.7.4 Paratext workflow and adds **local Logos Desktop verse navigation**, plus the small-screen/UI cleanup requested during field use.
 
 ```text
-.apps/translationCoreAI/paratextNotes/<book>.notes.xml
+                       Navigation Broker
+                             │
+            ┌────────────────┼────────────────┐
+            │                │                │
+     AI Bridge UI       Paratext 9.5      Logos Desktop
+            │                │                │
+            └──── accepted Scripture reference ────┘
 ```
 
-The application can export that XML from the Production workspace. Direct authenticated posting into a Paratext server/project is deliberately not claimed in this release; the output is a compatible exchange file.
+Navigation may originate in the Bridge, Paratext, or Logos. The Bridge is the broker: it suppresses recent echoes and duplicate polls, validates the reference against loaded translationCore projects, and forwards accepted changes only to the *other* enabled connector(s). Rapid Bridge→Logos requests are coalesced so the latest verse wins.
 
-### 6. Color-coded AI Proposal
-The AI alignment proposal now visually separates evidence roles:
-- **source language** (e.g. Hebrew) — purple;
-- **target language** (e.g. Tamil) — teal/green;
-- **English rationale** — slate/gray;
-- **confidence** — green (high), amber (medium), red (low).
+### Logos connector
 
-The same renderer uses the detected source/target language names, so the proposal is not hard-coded to Hebrew→Tamil.
+- Windows-local COM automation through the registered `LogosBibleSoftware.Launcher` component;
+- reads the current Bible reference from active/open Logos panels;
+- Bridge → Logos verse navigation;
+- Logos → Bridge verse navigation;
+- Paratext → Bridge → Logos and Logos → Bridge → Paratext when both sync options are enabled;
+- no Logos credentials, network listener, or Scripture-writing command;
+- Logos synchronization starts **off** each Bridge session so another application cannot silently take navigation control after restart.
 
-### 7. Official product identity
-The supplied official AI Bridge logo is now the release icon source for the app UI, Windows EXE, installer and user guide.
+The Logos COM helper is packaged with the Windows build. Actual COM behavior must still be field-tested against the user's installed Logos Desktop version; this source environment cannot certify Windows COM.
 
-## Human authority boundary
 
-```text
-translationCore project + project-pinned Translation Helps
-                         ↓
-              deterministic resolver
-                         ↓
-                  AI preparation
-                         ↓
-      false-positive / confidence evidence gate
-                         ↓
-           evidence + proposal + priority
-                         ↓
-                    HUMAN REVIEW
-                         ↓
-          approved translationCore state
-```
+### v0.7.5 Stability Fix
 
-AI never silently rewrites Scripture, completes TN/TW, approves alignment, changes terminology, or gives final publication approval.
+After Windows field testing confirmed Bridge ↔ Paratext ↔ Logos synchronization, the stability patch adds broker rollback/retry safety, Logos helper-generation isolation, cold-start timeout hardening, a single-owner Windows navigation mutex, and explicit versification/reference-label safety messaging. It does not add Scripture writing or change the working Paratext Project Notes protocol.
+
+## v0.7.5 responsive/UI changes
+
+- Dashboard exception queue and selected-exception summary are side-by-side in a draggable pane; the details pane has vertical scrolling.
+- The duplicated **Workspace** sidebar is removed. **User Guide** and **Keyboard Shortcuts** live under **Help**.
+- **AI Final Review** is renamed **tN tW Review** and appears before Alignment.
+- Alignment actions are reduced to the reviewer flow: manual edit → AI preparation/audit → human save/approval, with secondary diagnostics/restoration under **More…**.
+- Tooltips are guaranteed for normal action buttons and are clamped to the visible monitor work area so they do not run off-screen.
+- Production and Settings & Log sections are collapsible and remain vertically scrollable on small screens.
+- Settings shows Bridge-recorded lifetime API tokens and estimated API cost. These totals are local Bridge observations, **not an OpenAI account billing statement**.
+
+## Paratext remains preserved
+
+v0.7.5 does not replace the v0.7.4 Paratext companion connector. The existing local named-pipe/Plugin API workflow remains the primary route for project identity, two-way verse navigation and Project Notes. Existing translationCore↔Paratext project binding and no-Scripture-write safeguards remain in force.
 
 ## Main workspaces
 
-- **Dashboard** — project scan, project-wide exception-first queue, changed chapter/book preparation.
-- **Alignment** — source `topWords` ↔ target `bottomWords`, manual/AI proposal, Undo/Redo, tC-approved save.
-- **AI Final Review** — TN/TW selections, verdicts, corrections, confidence, evidence and fast-review controls.
-- **Quality Queue** — deterministic + AI QA with human finding decisions and Scripture editor.
-- **tC Check State** — selections, invalidations, comments, verse edits, current/stale status.
-- **Knowledge Base** — project-aware TN/TA/TW/TWL/source/reference provenance.
-- **Terminology** — human rules + book-level Translation Words analytics.
-- **Psalms QA** — Hebrew structural/parallelism candidates and alignment-density checks.
-- **Production** — recovery journal, Git, team assignments/roles, metrics, reports, security, benchmark, language/plugin status and Paratext Notes export.
-- **Settings & Log** — API security, model routing, cost warning, privacy manifest and redacted diagnostics.
+- **Dashboard** — exception-first project review.
+- **tN tW Review** — Translation Notes/Words evidence and human decisions.
+- **Alignment** — manual alignment, gap-fill AI, read-only audit and human approval.
+- **Quality Queue** — deterministic/AI issues and audited Scripture correction.
+- **tC Check State** — native translationCore selections/comments/invalidation state.
+- **Knowledge Base** — TN/TA/TW/TWL/source/reference evidence.
+- **Terminology** — trusted terminology decisions and analytics.
+- **Psalms QA** — candidate structure/parallelism QA.
+- **Production** — recovery, Git, team roles, reports, Paratext, Logos and metrics.
+- **Settings & Log** — API/model settings, usage totals, connectors, safety and logs.
+
+## Source/regression testing
+
+The packaged v0.7.5 Stability Fix source discovers **185 tests** in this build environment. All runnable tests pass; **57 backend-dependent tests are skipped** here because the user's real translationCore/Windows Paratext/Logos environment is not mounted. The exact packaged ZIP is re-extracted and retested before release.
+
+For Windows certification, continue using a disposable copy of the translationCore backend and separately field-test both Paratext and Logos connectors on the target computer.
+
+---
+
+## v0.7.4 Paratext baseline retained below
+
+## translationCore AI Bridge v0.7.4 — Paratext Live Connector
+
+Windows desktop companion for translationCore Bible translation projects. The Bridge combines deterministic translationCore-compatible data handling with AI-assisted alignment, Translation Notes/Words review, QA, terminology and evidence gathering while keeping the reviewer as final authority.
+
+## v0.7.4 focus
+
+v0.7.4 adds a **live local Paratext 9.5 connector** while preserving the v0.7.3 Alignment Reliability architecture.
+
+```text
+translationCore project
+        │
+        ▼
+translationCore AI Bridge (Python/Tk)
+        │
+        │ Windows named pipe — local computer only
+        ▼
+AI Bridge Paratext Connector (.ptxplg)
+        │
+        ▼
+Official Paratext Plugin API
+        │
+        ▼
+Paratext 9.5
+```
+
+Targeted field-test version: **Paratext 9.5.110.1**.
+
+## Live Paratext capabilities
+
+- current Paratext user;
+- active Paratext project, project ID and language;
+- current Scripture reference and scroll/sync group;
+- selected Scripture text and nearby context;
+- Bridge → Paratext verse navigation;
+- Paratext → Bridge verse navigation;
+- direct Project Notes on exact selected text;
+- verse-level Project Notes when no text selection is supplied;
+- explicit translationCore↔Paratext project binding;
+- optional forwarding of Needs Discussion / Reject reviewer comments.
+
+**Scripture writing is disabled in the connector.** There is no `PutUSFM`, `PutUSFMTokens`, or `PutUSX` command.
+
+## Install the Paratext connector
+
+1. Extract the v0.7.4 package.
+2. Run `diagnose_paratext_connector.bat` if you want to check prerequisites.
+3. Close Paratext completely.
+4. Run `install_paratext_connector.bat`.
+5. Restart Paratext and open the target Scripture project.
+6. Put its Scripture window in scroll/sync group A–E.
+7. Start the Bridge.
+8. Open **Production → Paratext**.
+9. Click **Connect / Refresh**.
+10. Click **Verify / Bind Project**.
+11. Enable **Sync verse navigation** if desired.
+
+If Paratext is not auto-detected:
+
+```bat
+install_paratext_connector.bat "C:\Program Files\Paratext 9"
+```
+
+Use the actual folder containing `Paratext.exe`.
+
+See `paratext_connector/INSTALL_WINDOWS.md` for the full procedure.
+
+## Why compile the connector on the Paratext computer?
+
+The Windows builder references the PluginInterfaces assembly from the **installed Paratext** and produces `translationCoreAIBridge.ptxplg` locally. This is safer for the initial field release than claiming a plugin binary built against an unverified interface version. No Visual Studio project is required by our builder; it attempts to use the Windows .NET Framework C# compiler already available on the machine.
+
+## Project binding safety
+
+Live notes and synchronized navigation require a stored per-translationCore-project Paratext project ID. If the active Paratext project does not match:
+
+```text
+Bridge binding: PROJECT MISMATCH
+```
+
+and the Bridge blocks the live action rather than guessing.
+
+## Alignment reliability
+
+The v0.7.3 architecture remains unchanged:
+
+```text
+AI linguistic links
+      ↓
+deterministic Alignment Compiler
+      ↓
+strict translationCore validator
+      ↓
+human review
+      ↓
+approved project data
+```
+
+Existing completed/human work remains protected. `Fill Alignment Gaps` is the normal AI workflow; `Audit Existing Alignment` is read-only.
+
+## Main workspaces
+
+- **Dashboard** — exception-first project review.
+- **Alignment** — manual alignment, gap-fill AI, audit, diagnostics, approval.
+- **AI Final Review** — TN/TW and QA evidence with human decisions.
+- **Quality Queue** — deterministic/AI issues and audited Scripture correction.
+- **tC Check State** — native translationCore selections/comments/invalidation state.
+- **Knowledge Base** — TN/TA/TW/TWL/source/reference evidence.
+- **Terminology** — trusted terminology decisions and analytics.
+- **Psalms QA** — candidate structure/parallelism QA.
+- **Production** — recovery, Git, team roles, reports, Existing Work Scan, Paratext Notes and Live Connector.
+- **Settings & Log** — AI/model/Paratext settings and diagnostics.
 
 ## Windows certification
 
-Use 64-bit Python 3.11 or 3.12 for source/runtime certification:
+Run against your translationCore root:
 
 ```bat
-certify_windows.bat "C:\path\to\translationCore"
+certify_windows.bat "C:\Users\Benz\translationCore"
 ```
 
-The certifier creates a disposable project clone and never uses the live translationCore projects as write targets.
+v0.7.4 test discovery is **152 tests: 118 core/data + 34 isolated Tk GUI**. The certifier uses a disposable clone for write-capable translationCore tests.
 
-Expected v0.7.0 discovery:
-
-```text
-Core/data/production: 75
-Isolated Tk GUI:      24
-Total:                99
-```
-
-## Fresh Windows distribution
-
-End users should receive the packaged Setup EXE; they do not need Python/Tk/Pillow/PyInstaller/Inno Setup installed. Git is optional and only affects Git checkpoint/history features.
-
-Build on a Windows build machine:
-
-```bat
-build_windows_installer.bat
-```
-
-See `docs/WINDOWS_CERTIFICATION_CHECKLIST.md` before distributing the packaged EXE/installer.
+Then separately certify the live connector using `paratext_connector/INSTALL_WINDOWS.md`, because the plugin must be compiled/loaded against the actual Paratext installation.

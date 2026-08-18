@@ -66,7 +66,7 @@ def validate_paths(source_raw: str, dest_raw: str) -> tuple[Path, Path, Path]:
             raise SystemExit(f'SAFETY REFUSAL: {reason}: {dest}')
 
     # The batch runner deliberately creates a uniquely named temporary parent.
-    if 'tc_ai_bridge_v070_cert_' not in dest.parent.name.lower():
+    if 'tc_ai_bridge_v073_cert_' not in dest.parent.name.lower():
         raise SystemExit(
             'SAFETY REFUSAL: destination is not inside the expected uniquely named '
             f'certification temp directory: {dest}'

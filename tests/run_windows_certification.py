@@ -32,6 +32,7 @@ def is_real_tk_test(test_id: str) -> bool:
         or test_id.startswith('tests.test_ui_workflows.')
         or '.UIv04Tests.' in test_id
         or '.ResponsiveUITests.' in test_id
+        or '.V075UITests.' in test_id
     )
 
 

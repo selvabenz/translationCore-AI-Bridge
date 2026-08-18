@@ -168,8 +168,14 @@ class ResponsiveUITests(unittest.TestCase):
         self.app.geometry('760x560'); self.app.update(); time.sleep(.05); self.app.update()
         self.assertEqual(self.app.status_bar.winfo_manager(),'pack'); self.assertTrue(self.app.status_bar.winfo_ismapped()); self.assertEqual(self.app.job_progress.winfo_manager(),'grid')
         self.assertTrue(self.app.usage_var.get().startswith('Tokens')); self.assertTrue(self.app.cost_var.get().startswith('Cost'))
-        self.assertEqual(self.app.notebook.tab(0,'text'),'Dash'); self.assertEqual(self.app.notebook.tab(2,'text'),'AI Review')
-        self.assertEqual(self.app.align_toolbar.winfo_manager(),'grid'); self.assertFalse(bool(self.app.sidebar.winfo_manager()))
+        # v0.7.5 intentionally moved/renamed the review workspace and removed the
+        # duplicate Workspace sidebar.  Keep this older responsive regression test
+        # focused on the invariant it owns: small-screen navigation remains visible.
+        self.assertEqual(self.app.notebook.tab(0,'text'),'Dash')
+        self.assertEqual(self.app.notebook.tab(1,'text'),'tN/tW')
+        self.assertEqual(self.app.notebook.tab(2,'text'),'Align')
+        self.assertEqual(self.app.align_toolbar.winfo_manager(),'grid')
+        self.assertFalse(hasattr(self.app,'sidebar'))
         self.assertTrue(all(w.winfo_ismapped() for w in self.app.dashboard_action_widgets))
         self.assertNotIn(str(self.app.align_group_frame),list(self.app.align_token_pane.panes()))
         self.app.notebook.select(self.app.align_tab); self.app.update()
@@ -186,8 +192,8 @@ class ResponsiveUITests(unittest.TestCase):
         self.assertTrue(str(self.app.group_list.cget('xscrollcommand')))
         self.assertTrue(str(self.app.compact_group_list.cget('xscrollcommand')))
         self.app.notebook.select(self.app.review_tab); self.app.update()
-        self.assertEqual(str(self.app.review_detail.cget('wrap')),'none')
-        self.assertTrue(str(self.app.review_detail.cget('xscrollcommand')))
+        # Result + Evidence is explanatory prose: wrap instead of horizontal panning.
+        self.assertEqual(str(self.app.review_detail.cget('wrap')),'word')
         self.assertTrue(str(self.app.review_tree.cget('xscrollcommand')))
 
     def test_core_controls_have_tooltips(self):

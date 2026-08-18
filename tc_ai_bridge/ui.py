@@ -11,6 +11,9 @@ import gc
 import webbrowser
 import sys
 import shutil
+import os
+import uuid
+from datetime import datetime
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from pathlib import Path
@@ -27,6 +30,7 @@ from .security import sanitize_for_log, scan_tree_for_secrets
 
 from .ai_client import AIError, OpenAIResponsesClient
 from .alignment_engine import AlignmentError, apply_proposal, make_inventory, realign, token_label, unalign_bottom, validate_proposal
+from .alignment_reliability import make_request_context, request_context_matches, proposal_difference
 from .local_checks import run_local_qa
 from .knowledge_base import TranslationHelpsKnowledgeBase
 from .models import AICheckReview, QAIssue, VerseAlignment
@@ -34,36 +38,90 @@ from .secret_store import AppSettings
 from .session import EditSession
 from .tc_project import ProjectError, TranslationCoreProject, TranslationCoreRoot
 from .usfm import strip_usfm
+from .text_graphemes import nearest_grapheme_boundary, previous_grapheme_boundary, next_grapheme_boundary
+from .identity import detect_project_identity
+from .paratext_connector import ParatextConnectorClient, ParatextConnectorError
+from .logos_connector import LogosConnectorClient, LogosConnectorError
+from .navigation import NavigationBroker, NavigationOwnership, normalize_reference
+from .paratext_notes import EXTERNAL_NOTE_SOURCE, iter_notes_11, normalized_notes_11_copy
 
 
 class _ToolTip:
-    """Small native tooltip with delayed display and safe teardown."""
+    """Small native tooltip with delayed display and monitor/work-area clamping."""
     def __init__(self, widget, text: str, delay_ms: int = 450):
         self.widget=widget; self.text=text; self.delay_ms=delay_ms; self._after=None; self._tip=None
         widget.bind('<Enter>', self._schedule, add='+')
         widget.bind('<Leave>', self._hide, add='+')
         widget.bind('<ButtonPress>', self._hide, add='+')
+
     def _schedule(self, event=None):
         self._cancel()
         try: self._after=self.widget.after(self.delay_ms,self._show)
         except tk.TclError: pass
+
     def _cancel(self):
         if self._after is not None:
             try: self.widget.after_cancel(self._after)
             except tk.TclError: pass
             self._after=None
+
+    def _work_area(self):
+        """Return the visible monitor work area around the widget, excluding taskbar on Windows."""
+        try:
+            x=int(self.widget.winfo_rootx()); y=int(self.widget.winfo_rooty())
+            w=max(1,int(self.widget.winfo_width())); h=max(1,int(self.widget.winfo_height()))
+            if os.name == 'nt':
+                import ctypes
+                from ctypes import wintypes
+                class RECT(ctypes.Structure):
+                    _fields_=[('left',wintypes.LONG),('top',wintypes.LONG),('right',wintypes.LONG),('bottom',wintypes.LONG)]
+                class MONITORINFO(ctypes.Structure):
+                    _fields_=[('cbSize',wintypes.DWORD),('rcMonitor',RECT),('rcWork',RECT),('dwFlags',wintypes.DWORD)]
+                user32=ctypes.windll.user32
+                MONITOR_DEFAULTTONEAREST=2
+                rect=RECT(x,y,x+w,y+h)
+                monitor=user32.MonitorFromRect(ctypes.byref(rect),MONITOR_DEFAULTTONEAREST)
+                info=MONITORINFO(); info.cbSize=ctypes.sizeof(MONITORINFO)
+                if monitor and user32.GetMonitorInfoW(monitor,ctypes.byref(info)):
+                    r=info.rcWork
+                    return int(r.left),int(r.top),int(r.right),int(r.bottom)
+            return 0,0,int(self.widget.winfo_screenwidth()),int(self.widget.winfo_screenheight())
+        except Exception:
+            return 0,0,1920,1080
+
     def _show(self):
         self._after=None
         try:
             if not self.widget.winfo_exists() or self._tip is not None: return
-            x=self.widget.winfo_rootx()+12; y=self.widget.winfo_rooty()+self.widget.winfo_height()+6
-            tip=tk.Toplevel(self.widget); tip.wm_overrideredirect(True); tip.wm_geometry(f'+{x}+{y}')
+            tip=tk.Toplevel(self.widget); tip.wm_overrideredirect(True)
             try: tip.wm_attributes('-topmost',True)
             except tk.TclError: pass
-            ttk.Label(tip,text=self.text,justify='left',padding=(7,4),wraplength=420,relief='solid',borderwidth=1).pack()
+            label=ttk.Label(tip,text=self.text,justify='left',padding=(7,4),wraplength=420,relief='solid',borderwidth=1)
+            label.pack()
+            # Measure first, then choose a placement guaranteed to remain inside the
+            # current monitor's usable work area. This fixes right/bottom clipping on
+            # 1366x768 and multi-monitor Windows layouts.
+            tip.update_idletasks()
+            tw=max(1,tip.winfo_reqwidth()); th=max(1,tip.winfo_reqheight())
+            left,top,right,bottom=self._work_area(); margin=6
+            wx=self.widget.winfo_rootx(); wy=self.widget.winfo_rooty(); wh=self.widget.winfo_height(); ww=self.widget.winfo_width()
+            x=wx+12; y=wy+wh+6
+            if x+tw>right-margin: x=wx+ww-tw-4
+            if x<left+margin: x=left+margin
+            if y+th>bottom-margin: y=wy-th-6
+            if y<top+margin: y=top+margin
+            # A very long tooltip can be wider than a tiny screen. Reduce wrap and remeasure.
+            available=max(180,right-left-(margin*2))
+            if tw>available:
+                label.configure(wraplength=max(160,available-20)); tip.update_idletasks(); tw=tip.winfo_reqwidth(); th=tip.winfo_reqheight()
+                x=min(max(left+margin,wx+12),max(left+margin,right-margin-tw))
+                y=wy-th-6 if wy+wh+6+th>bottom-margin else wy+wh+6
+                y=max(top+margin,min(y,bottom-margin-th))
+            tip.wm_geometry(f'+{int(x)}+{int(y)}')
             self._tip=tip
         except tk.TclError:
             self._tip=None
+
     def _hide(self,event=None):
         self._cancel()
         if self._tip is not None:
@@ -72,11 +130,59 @@ class _ToolTip:
             self._tip=None
 
 
+class _CollapsibleSection(ttk.Frame):
+    """Persistent collapsible fieldset with a left-aligned clickable legend.
+
+    Production and Settings used to render section titles as full-width centred buttons.
+    The legend row now behaves like a conventional fieldset: the disclosure arrow/title is
+    anchored at the left edge and a separator carries the visual boundary across the rest of
+    the available width. This also avoids wasting vertical space on small screens.
+    """
+    def __init__(self, parent, title: str, settings: AppSettings, key: str, *, expanded: bool=True, padding=6):
+        super().__init__(parent)
+        self.title=title; self.settings=settings; self.key=key
+        collapsed=settings.get_setting('collapsed_sections',{})
+        if not isinstance(collapsed,dict): collapsed={}
+        self.expanded=not bool(collapsed.get(key,not expanded))
+
+        self.legend_row=ttk.Frame(self)
+        self.legend_row.pack(fill='x')
+        self.header=ttk.Label(self.legend_row,style='CollapsibleLegend.TLabel',cursor='hand2',takefocus=True,anchor='w')
+        self.header.pack(side='left',anchor='w',padx=(2,6))
+        self.legend_rule=ttk.Separator(self.legend_row,orient='horizontal')
+        self.legend_rule.pack(side='left',fill='x',expand=True,pady=(10,0))
+        self.header.bind('<Button-1>',lambda e:self.toggle(),add='+')
+        self.header.bind('<Return>',lambda e:(self.toggle(),'break')[1],add='+')
+        self.header.bind('<space>',lambda e:(self.toggle(),'break')[1],add='+')
+
+        # A framed body gives the expanded section a fieldset-like boundary while allowing the
+        # collapsed section to shrink to just its legend row (ttk.LabelFrame retains child size
+        # even after pack_forget on some Tk themes, so it is intentionally not used here).
+        self.body_shell=ttk.Frame(self,relief='groove',borderwidth=1)
+        self.body=ttk.Frame(self.body_shell,padding=padding)
+        self.body.pack(fill='both',expand=True)
+        self._apply()
+
+    def _apply(self):
+        self.header.configure(text=('▼ ' if self.expanded else '▶ ')+self.title)
+        if self.expanded:
+            if not self.body_shell.winfo_manager(): self.body_shell.pack(fill='both',expand=True,pady=(1,0))
+        else:
+            if self.body_shell.winfo_manager(): self.body_shell.pack_forget()
+
+    def toggle(self):
+        self.expanded=not self.expanded; self._apply()
+        collapsed=self.settings.get_setting('collapsed_sections',{})
+        if not isinstance(collapsed,dict): collapsed={}
+        collapsed=dict(collapsed); collapsed[self.key]=not self.expanded
+        self.settings.set_setting('collapsed_sections',collapsed)
+
+
 
 class BridgeApp(tk.Tk):
     def __init__(self, initial_root: str | None = None, settings_path: Path | None = None):
         super().__init__()
-        self.title('translationCore AI Bridge v0.7.0')
+        self.title('translationCore AI Bridge v0.7.5')
         self.geometry('1440x900')
         self.minsize(760, 560)
         self._small_screen = False
@@ -98,9 +204,38 @@ class BridgeApp(tk.Tk):
         # a proposed alignment. Keep it so TN/TW token IDs can be resolved to exact token signatures.
         self.review_alignment_for_checks: VerseAlignment | None = None
         self.review_meta: dict = {}
+        self.last_alignment_diagnostics: dict = {}
+        self._active_alignment_request = None
+        self.paratext_connector = ParatextConnectorClient()
+        self.paratext_connector_state = None
+        self.paratext_nav_sync_var = tk.BooleanVar(value=False)
+        self.paratext_live_review_notes_var = tk.BooleanVar(value=False)
+        self._paratext_poll_after_id = None
+        self._last_paratext_sent_ref = ''
+        self._last_paratext_origin_id = ''
+        # One navigation broker owns Bridge/Paratext/Logos reference propagation.
+        self.navigation_broker = NavigationBroker()
+        self._navigation_owner = NavigationOwnership()
+        self._navigation_origin = 'bridge'
+        self._navigation_suppress_broadcast = False
+        self.logos_connector = LogosConnectorClient()
+        self.logos_connector_state = None
+        self.logos_nav_sync_var = tk.BooleanVar(value=False)
+        self._logos_poll_after_id = None
+        self._last_logos_sent_ref = ''
+        self._last_logos_origin_id = ''
+        # Logos COM calls run outside Tk's main thread. Navigation is coalesced so rapid
+        # verse changes are latest-wins instead of replaying a long stale queue.
+        self._logos_async_queue: queue.Queue = queue.Queue()
+        self._logos_nav_lock = threading.Lock()
+        # Worker-visible state lives in a plain dict so background connector threads never
+        # retain/dereference the Tk root; this preserves the Windows Tcl cleanup safety rule.
+        self._logos_async_state = {'nav_worker_running':False,'pending_nav':None,'poll_inflight':False}
         self.kb: TranslationHelpsKnowledgeBase | None = None
         self._busy = False
         self._api_state = 'unknown'
+        self._ai_blink_after_id = None
+        self._ai_blink_phase = False
         self._active_job_label = ''
         self._ui_queue: queue.Queue = queue.Queue()
         self._bg_success_handler = None
@@ -123,11 +258,47 @@ class BridgeApp(tk.Tk):
             self.after(50, lambda: self.load_root(initial_root))
         if self.settings.get_api_key():
             self.after(450, self._auto_test_api)
+        self.after(100, self._drain_logos_async_queue)
 
     def _tip(self, widget, text: str):
         if widget is not None and text:
-            self._tooltips.append(_ToolTip(widget,text))
+            # Avoid stacking duplicate tooltip windows when language context refreshes.
+            if not getattr(widget,'_tc_tooltip_bound',False):
+                self._tooltips.append(_ToolTip(widget,text)); widget._tc_tooltip_bound=True
         return widget
+
+    def _ensure_button_tooltips(self):
+        """Guarantee every normal action button has at least concise discoverable help."""
+        descriptions={
+            'Refresh Project Scan':'Re-scan project state and rebuild the exception-first queue without modifying project files.',
+            'Prepare Changed / Untouched Chapter':'Prepare AI review only for chapter verses whose cached review is missing or stale.',
+            'Force Full Chapter Audit':'Re-run AI preparation for every numbered verse in the current chapter, even if cached review is current.',
+            'Prepare Changed Book':'Prepare changed or untouched verses across the current book; unchanged current cache entries are skipped.',
+            'Cancel Batch':'Stop after the current background request finishes; completed work remains recorded.',
+            'Review Highest Priority':'Open the highest-priority exception from the Dashboard queue.',
+            'Save Settings':'Save non-secret settings and securely persist enabled credentials.',
+            'Test API Connection':'Test the configured OpenAI API connection without changing translation data.',
+            'What Was Sent to AI?':'Show the privacy/provenance manifest for the current AI review.',
+            'Install / Update Connector…':'Install or update the local Paratext companion plugin. Close Paratext before using this action.',
+            'Connect / Refresh':'Refresh the local connector state.',
+            'Verify / Bind Project':'Verify or explicitly bind the current translationCore project to the active Paratext project.',
+            'Sync Notes':'Send pending reviewer notes through the local Paratext Project Notes API.',
+            'Export Notes XML…':'Export a Notes 1.1 XML backup using the real Paratext user as note author.',
+            'Refresh':'Refresh the information shown on this page.',
+            'Export QA Report…':'Export the current project QA report to a folder you choose.',
+            'Existing Work Scan':'Run the read-only compatibility scan that protects existing translationCore work.',
+        }
+        def walk(widget):
+            try: children=widget.winfo_children()
+            except tk.TclError:return
+            for child in children:
+                if isinstance(child,(ttk.Button,ttk.Menubutton)) and not getattr(child,'_tc_tooltip_bound',False):
+                    try:text=str(child.cget('text')).strip()
+                    except Exception:text=''
+                    if text:
+                        self._tip(child,descriptions.get(text,f'Run {text}.'))
+                walk(child)
+        walk(self)
 
     def _asset_path(self, name: str) -> Path:
         base = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent.parent))
@@ -181,19 +352,26 @@ class BridgeApp(tk.Tk):
             if hasattr(self,'dashboard_scan'):
                 self.dashboard_scan.configure(height=6 if compact else (8 if small else 10))
             self._reflow_toolbar(getattr(self,'dashboard_actions',None),getattr(self,'dashboard_action_widgets',[]),3 if small else 5)
+            self._reflow_toolbar(getattr(self,'production_toolbar',None),getattr(self,'production_toolbar_widgets',[]),2 if compact else (3 if small else 4))
+            self._reflow_toolbar(getattr(self,'paratext_actions',None),getattr(self,'paratext_action_widgets',[]),2 if small else 4)
+            self._reflow_toolbar(getattr(self,'logos_actions',None),getattr(self,'logos_action_widgets',[]),1 if compact else 2)
+            self._layout_production_columns(small)
             full_wrap=max(360,width-90)
             half_wrap=max(240,(width-120)//2)
             for name in ('dashboard_summary_label','review_summary_label','qa_summary_label','kb_intro_label','psalms_info_label','safety_label'):
                 label=getattr(self,name,None)
                 if label is not None: label.configure(wraplength=full_wrap)
-            for name in ('tx_status_label','git_status_label','team_status_label','plugins_label','paratext_notes_label'):
+            for name in ('tx_status_label','git_status_label','team_status_label','plugins_label'):
                 label=getattr(self,name,None)
-                if label is not None: label.configure(wraplength=half_wrap)
+                if label is not None: label.configure(wraplength=full_wrap if small else half_wrap)
+            for name in ('paratext_notes_label','paratext_connector_label','paratext_selection_label','logos_status_label'):
+                label=getattr(self,name,None)
+                if label is not None: label.configure(wraplength=full_wrap if small else half_wrap)
             if hasattr(self,'_tab_defs') and hasattr(self,'notebook'):
                 labels=self._compact_tab_labels if small else [x[0] for x in self._tab_defs]
                 for i,label in enumerate(labels):
                     self.notebook.tab(i,text=label)
-            self._reflow_toolbar(getattr(self,'align_toolbar',None),getattr(self,'align_toolbar_widgets',[]),3 if compact else (5 if small else 9))
+            self._layout_alignment_toolbar(small)
             self._reflow_toolbar(getattr(self,'review_header_toolbar',None),getattr(self,'review_header_widgets',[]),2 if compact else (3 if small else 5))
             self._reflow_toolbar(getattr(self,'review_actions',None),getattr(self,'review_action_widgets',[]),2 if compact else (3 if small else 5))
             self._reflow_toolbar(getattr(self,'qa_toolbar',None),getattr(self,'qa_toolbar_widgets',[]),2 if compact else (3 if small else 5))
@@ -210,6 +388,22 @@ class BridgeApp(tk.Tk):
             w.grid(row=i//columns,column=i%columns,sticky='ew',padx=2,pady=2)
         for c in range(columns): frame.columnconfigure(c,weight=1)
 
+    def _layout_alignment_toolbar(self, stacked: bool):
+        if not hasattr(self,'align_toolbar_groups'): return
+        try:
+            for w in list(self.align_toolbar_groups)+list(getattr(self,'align_toolbar_separators',[])):
+                w.grid_forget()
+            if stacked:
+                for row,group in enumerate(self.align_toolbar_groups):
+                    group.grid(row=row,column=0,sticky='ew',pady=1); self.align_toolbar.columnconfigure(0,weight=1)
+            else:
+                col=0
+                for i,group in enumerate(self.align_toolbar_groups):
+                    group.grid(row=0,column=col,sticky='ew'); self.align_toolbar.columnconfigure(col,weight=1); col+=1
+                    if i<len(self.align_toolbar_groups)-1:
+                        sep=self.align_toolbar_separators[i]; sep.grid(row=0,column=col,sticky='ns',padx=3); self.align_toolbar.columnconfigure(col,weight=0); col+=1
+        except tk.TclError: pass
+
     def _resize_tree_columns(self):
         width=max(760,self.winfo_width())
         try:
@@ -220,7 +414,8 @@ class BridgeApp(tk.Tk):
                     sizes={'severity':82,'tool':120,'group':210,'verdict':95,'selection':280,'confidence':90}
                 for c,w in sizes.items(): self.review_tree.column(c,width=w,minwidth=55,stretch=True)
             if hasattr(self,'exception_tree'):
-                self.exception_tree.column('summary',width=380 if width<1080 else 650,stretch=True)
+                sizes={'ref':78,'cache':76,'critical':62,'high':58,'medium':66,'checks':62} if width<1080 else {'ref':92,'cache':88,'critical':72,'high':68,'medium':76,'checks':74}
+                for c,w in sizes.items(): self.exception_tree.column(c,width=w,minwidth=50,stretch=True)
         except tk.TclError: pass
 
     def _install_reviewer_shortcuts(self):
@@ -341,60 +536,6 @@ class BridgeApp(tk.Tk):
                 walk(child)
         walk(self)
 
-    @staticmethod
-    def _rounded_tab_image(w: int, h: int, radius: int, fill: str, cut: str) -> tk.PhotoImage:
-        """Procedurally draw a tab background with rounded top corners (no PIL dependency).
-
-        Corner pixels are filled with `cut` (the ambient window background), which fakes
-        transparency since Tk's PhotoImage has no cheap per-pixel alpha compositing here.
-        """
-        img = tk.PhotoImage(width=w, height=h)
-        img.put(cut, to=(0, 0, w, h))
-        for y in range(h):
-            if y < radius:
-                dy = radius - y
-                dx = radius - int(round((radius * radius - dy * dy) ** 0.5))
-            else:
-                dx = 0
-            x0, x1 = dx, w - dx
-            if x1 > x0:
-                img.put(fill, to=(x0, y, x1, y + 1))
-        return img
-
-    def _style_chrome_tabs(self, style: ttk.Style) -> None:
-        """Chrome-style tab strip: rounded top corners, gray/receding unselected tabs, a
-        white bold selected tab so the active workspace is unmistakable at a glance.
-        """
-        ambient_bg = '#f0f0f0'  # SystemButtonFace on Windows; matches the notebook's own background
-        w, h, radius = 28, 22, 6
-        self._tab_img_normal = self._rounded_tab_image(w, h, radius, '#e8eaed', ambient_bg)
-        self._tab_img_hover = self._rounded_tab_image(w, h, radius, '#f1f3f4', ambient_bg)
-        self._tab_img_selected = self._rounded_tab_image(w, h, radius, '#ffffff', ambient_bg)
-
-        style.configure('TNotebook', tabmargins=[2, 4, 2, 0], background=ambient_bg)
-        style.configure('TNotebook.Tab', padding=[10, 4], font=('Segoe UI', 10), foreground='#5f6368')
-        style.map('TNotebook.Tab',
-                  foreground=[('selected', '#000000'), ('active', '#202124')],
-                  font=[('selected', ('Segoe UI', 10, 'bold'))])
-
-        style.element_create('Chrome.tab', 'image', self._tab_img_normal,
-                              ('selected', self._tab_img_selected),
-                              ('active', self._tab_img_hover),
-                              border=(7, 6, 7, 2), sticky='nsew')
-
-        def substitute(layout):
-            out = []
-            for name, opts in layout:
-                opts = dict(opts)
-                if name == 'Notebook.tab':
-                    name = 'Chrome.tab'
-                if 'children' in opts:
-                    opts['children'] = substitute(opts['children'])
-                out.append((name, opts))
-            return out
-
-        style.layout('TNotebook.Tab', substitute(style.layout('TNotebook.Tab')))
-
     def _build_ui(self):
         style = ttk.Style(self)
         try:
@@ -406,7 +547,7 @@ class BridgeApp(tk.Tk):
         style.configure('Accent.TButton', font=('Segoe UI', 9, 'bold'))
         style.configure('Status.TLabel', font=('Segoe UI', 9))
         style.configure('Metric.TLabel', font=('Segoe UI', 9, 'bold'))
-        self._style_chrome_tabs(style)
+        style.configure('CollapsibleLegend.TLabel', font=('Segoe UI', 9, 'bold'), anchor='w')
 
         # Compact responsive header. The old screenshot-like product title is intentionally
         # removed from the client area; Windows still shows the real window title + app icon.
@@ -422,13 +563,15 @@ class BridgeApp(tk.Tk):
         self.root_entry=ttk.Entry(self.header,textvariable=self.root_var); self.root_entry.grid(row=0,column=2,sticky='ew',padx=5)
         self.browse_btn=ttk.Button(self.header,text='Browse…',command=self._browse_root); self.browse_btn.grid(row=0,column=3,padx=2)
         self.load_btn=ttk.Button(self.header,text='Load',command=lambda:self.load_root(self.root_var.get())); self.load_btn.grid(row=0,column=4,padx=2)
-        self.api_box=ttk.Frame(self.header); self.api_box.grid(row=0,column=5,rowspan=2,sticky='e',padx=(10,0))
+        self.help_btn=ttk.Menubutton(self.header,text='Help')
+        self.help_menu=tk.Menu(self.help_btn,tearoff=False); self.help_menu.add_command(label='User Guide',command=self._open_user_guide); self.help_menu.add_command(label='Keyboard Shortcuts',command=self._show_keyboard_shortcuts)
+        self.help_btn.configure(menu=self.help_menu); self.help_btn.grid(row=0,column=5,rowspan=2,sticky='e',padx=(8,0))
+        self.api_box=ttk.Frame(self.header); self.api_box.grid(row=0,column=6,rowspan=2,sticky='e',padx=(10,0))
         self.api_dot=tk.Canvas(self.api_box,width=22,height=22,highlightthickness=0)
         self.api_dot.grid(row=0,column=0,rowspan=2,padx=(0,4))
         self.api_status_var=tk.StringVar(value='API not tested')
         self.api_status_label=ttk.Label(self.api_box,textvariable=self.api_status_var); self.api_status_label.grid(row=0,column=1,sticky='e')
         self.api_test_btn=ttk.Button(self.api_box,text='Test API',command=self._test_api_connection); self.api_test_btn.grid(row=1,column=1,sticky='e',pady=(2,0))
-        ttk.Button(self.api_box,text='User Guide',command=self._open_user_guide).grid(row=0,column=2,rowspan=2,sticky='e',padx=(8,0))
         self._set_api_indicator('unknown','API not tested')
 
         self.project_var=tk.StringVar(); self.chapter_var=tk.StringVar(); self.verse_var=tk.StringVar()
@@ -442,13 +585,15 @@ class BridgeApp(tk.Tk):
         self.project_info_label=ttk.Label(nav,textvariable=self.project_info_var); self.project_info_label.grid(row=0,column=4,padx=(8,0),sticky='w')
         self.header.columnconfigure(2,weight=1)
 
+        # The duplicate Workspace sidebar consumed valuable horizontal space and repeated the
+        # notebook navigation. v0.7.5 uses the notebook as the single workspace navigator.
         self.body=ttk.Frame(self,padding=(8,0,8,4)); self.body.pack(fill='both',expand=True)
-        self.content=ttk.Frame(self.body); self.content.pack(side='left',fill='both',expand=True)
+        self.content=ttk.Frame(self.body); self.content.pack(fill='both',expand=True)
         self.notebook=ttk.Notebook(self.content); self.notebook.pack(fill='both',expand=True)
         self.dashboard_tab=ttk.Frame(self.notebook); self.align_tab=ttk.Frame(self.notebook); self.review_tab=ttk.Frame(self.notebook); self.qa_tab=ttk.Frame(self.notebook); self.tc_tab=ttk.Frame(self.notebook); self.kb_tab=ttk.Frame(self.notebook); self.term_tab=ttk.Frame(self.notebook); self.psalms_tab=ttk.Frame(self.notebook); self.production_tab=ttk.Frame(self.notebook); self.settings_tab=ttk.Frame(self.notebook)
-        tabs=[('Dashboard',self.dashboard_tab),('tN tW',self.review_tab),('Alignment',self.align_tab),('Quality Queue',self.qa_tab),('tC Check State',self.tc_tab),('Knowledge Base',self.kb_tab),('Terminology',self.term_tab),('Psalms QA',self.psalms_tab),('Production',self.production_tab),('Settings & Log',self.settings_tab)]
+        tabs=[('Dashboard',self.dashboard_tab),('tN tW Review',self.review_tab),('Alignment',self.align_tab),('Quality Queue',self.qa_tab),('tC Check State',self.tc_tab),('Knowledge Base',self.kb_tab),('Terminology',self.term_tab),('Psalms QA',self.psalms_tab),('Production',self.production_tab),('Settings & Log',self.settings_tab)]
         self._tab_defs=tabs
-        self._compact_tab_labels=['Dash','tN tW','Align','QA','tC','KB','Terms','Psalms','Prod','Settings']
+        self._compact_tab_labels=['Dash','tN/tW','Align','QA','tC','KB','Terms','Psalms','Prod','Settings']
         for label,tab in tabs: self.notebook.add(tab,text=label)
 
         self._build_dashboard_tab(); self._build_alignment_tab(); self._build_review_tab(); self._build_qa_tab(); self._build_tc_tab(); self._build_kb_tab(); self._build_terminology_tab(); self._build_psalms_tab(); self._build_production_tab(); self._build_settings_tab()
@@ -475,12 +620,13 @@ class BridgeApp(tk.Tk):
         self._tip(self.usage_label,'Observed OpenAI input/output token usage for the current/recent AI operation.')
         self._tip(self.cost_label,'Estimated API cost based on observed token usage and the selected model policy.')
         self._install_overflow_navigation()
+        self._ensure_button_tooltips()
         self.after(50,self._on_responsive_resize)
 
     def _build_dashboard_tab(self):
         outer = ttk.Frame(self.dashboard_tab, padding=10); outer.pack(fill='both', expand=True)
         title = ttk.Frame(outer); title.pack(fill='x')
-        ttk.Label(title, text='Project Analysis & Exception-First Review', font=('Segoe UI', 10, 'bold')).pack(side='left')
+        ttk.Label(title, text='Project Analysis & Exception-First Review', font=('Segoe UI', 13, 'bold')).pack(side='left')
         ttk.Button(title, text='Refresh Project Scan', command=self._refresh_dashboard_background).pack(side='right')
         self.dashboard_summary_var = tk.StringVar(value='Load a project to scan existing translationCore work.')
         self.dashboard_summary_label=ttk.Label(outer, textvariable=self.dashboard_summary_var, wraplength=1250); self.dashboard_summary_label.pack(fill='x', anchor='w', pady=(5,8))
@@ -497,17 +643,32 @@ class BridgeApp(tk.Tk):
 
         scan = ttk.LabelFrame(outer, text='Detected project state', padding=8); scan.pack(fill='x')
         scan.rowconfigure(0,weight=1); scan.columnconfigure(0,weight=1)
-        self.dashboard_scan = tk.Text(scan, height=10, wrap='none', font=('Consolas', 10)); dsy=ttk.Scrollbar(scan,orient='vertical',command=self.dashboard_scan.yview); dsx=ttk.Scrollbar(scan,orient='horizontal',command=self.dashboard_scan.xview); self.dashboard_scan.configure(yscrollcommand=dsy.set,xscrollcommand=dsx.set)
-        self.dashboard_scan.grid(row=0,column=0,sticky='nsew'); dsy.grid(row=0,column=1,sticky='ns'); dsx.grid(row=1,column=0,sticky='ew'); self.dashboard_scan.configure(state='disabled')
+        # Dashboard is human-readable prose/status: wrap at word boundaries so narrow screens never
+        # truncate the project analysis. Vertical scrolling remains available for long scans.
+        self.dashboard_scan = tk.Text(scan, height=10, wrap='word', font=('Nirmala UI', 10)); dsy=ttk.Scrollbar(scan,orient='vertical',command=self.dashboard_scan.yview); self.dashboard_scan.configure(yscrollcommand=dsy.set)
+        self.dashboard_scan.grid(row=0,column=0,sticky='nsew'); dsy.grid(row=0,column=1,sticky='ns'); self.dashboard_scan.configure(state='disabled')
 
         q = ttk.LabelFrame(outer, text='Exception queue — Critical / High / Review / Stale first', padding=6); q.pack(fill='both', expand=True, pady=(8,0))
-        cols=('ref','cache','critical','high','medium','checks','summary')
         q.rowconfigure(0,weight=1); q.columnconfigure(0,weight=1)
-        self.exception_tree = ttk.Treeview(q, columns=cols, show='headings', selectmode='browse')
-        for c,w in [('ref',90),('cache',90),('critical',70),('high',70),('medium',75),('checks',80),('summary',650)]:
-            self.exception_tree.heading(c,text=c.title()); self.exception_tree.column(c,width=w,anchor='w')
-        exy=ttk.Scrollbar(q,orient='vertical',command=self.exception_tree.yview); exx=ttk.Scrollbar(q,orient='horizontal',command=self.exception_tree.xview); self.exception_tree.configure(yscrollcommand=exy.set,xscrollcommand=exx.set)
-        self.exception_tree.grid(row=0,column=0,sticky='nsew'); exy.grid(row=0,column=1,sticky='ns'); exx.grid(row=1,column=0,sticky='ew'); self.exception_tree.bind('<Double-1>', self._dashboard_open_selected)
+        # v0.7.5: keep the compact queue and the selected exception side-by-side. The
+        # previous stacked detail area became too shallow on 1366x768 displays.
+        self.dashboard_exception_pane=ttk.Panedwindow(q,orient='horizontal'); self.dashboard_exception_pane.grid(row=0,column=0,sticky='nsew')
+        tree_holder=ttk.Frame(self.dashboard_exception_pane); tree_holder.rowconfigure(0,weight=1); tree_holder.columnconfigure(0,weight=1)
+        detail=ttk.LabelFrame(self.dashboard_exception_pane,text='Selected exception summary',padding=4); detail.rowconfigure(0,weight=1); detail.columnconfigure(0,weight=1)
+        self.dashboard_exception_pane.add(tree_holder,weight=3); self.dashboard_exception_pane.add(detail,weight=2)
+        cols=('ref','cache','critical','high','medium','checks')
+        self.exception_tree = ttk.Treeview(tree_holder, columns=cols, show='headings', selectmode='browse')
+        for c,w in [('ref',82),('cache',82),('critical',64),('high',64),('medium',70),('checks',70)]:
+            self.exception_tree.heading(c,text=c.title()); self.exception_tree.column(c,width=w,minwidth=52,anchor='w',stretch=True)
+        exy=ttk.Scrollbar(tree_holder,orient='vertical',command=self.exception_tree.yview); self.exception_tree.configure(yscrollcommand=exy.set)
+        self.exception_tree.grid(row=0,column=0,sticky='nsew'); exy.grid(row=0,column=1,sticky='ns')
+        self.exception_detail=tk.Text(detail,height=9,wrap='word',font=('Nirmala UI',10),relief='flat')
+        exd=ttk.Scrollbar(detail,orient='vertical',command=self.exception_detail.yview); self.exception_detail.configure(yscrollcommand=exd.set)
+        self.exception_detail.grid(row=0,column=0,sticky='nsew'); exd.grid(row=0,column=1,sticky='ns'); self.exception_detail.configure(state='disabled')
+        self.exception_tree.bind('<<TreeviewSelect>>', self._dashboard_exception_selected)
+        self.exception_tree.bind('<Double-1>', self._dashboard_open_selected)
+        self._tip(self.exception_tree,'Exception-first queue. Select a row to read its complete summary on the right; double-click to open the verse.')
+        self._tip(self.exception_detail,'Complete selected exception summary. Text wraps and the vertical scrollbar remains available on smaller screens.')
         self._exception_rows: list[dict] = []
 
     def _build_alignment_tab(self):
@@ -518,32 +679,45 @@ class BridgeApp(tk.Tk):
         self.verse_text=tk.Text(textbox,height=2,wrap='word',font=('Nirmala UI',12),relief='flat'); vsy=ttk.Scrollbar(textbox,orient='vertical',command=self.verse_text.yview); self.verse_text.configure(yscrollcommand=vsy.set)
         self.verse_text.grid(row=0,column=0,sticky='nsew'); vsy.grid(row=0,column=1,sticky='ns'); self.verse_text.configure(state='disabled')
 
-        # Controls are outside the draggable proposal pane: moving the sash can never hide them.
+        # Alignment actions follow the reviewer workflow. Secondary diagnostics/restoration
+        # are under More… so the normal toolbar stays readable. Section boundaries use "|".
         self.align_toolbar=ttk.Frame(outer); self.align_toolbar.grid(row=1,column=0,sticky='ew',pady=5)
-        specs=[
-            ('Connect',self._connect_selected,''),('Unalign Target',self._unalign_selected,''),('Undo',self._undo,''),('Redo',self._redo,''),
-            ('AI Suggest',self._ai_suggest,'Accent.TButton'),('AI Full Review',self._run_full_review,'Accent.TButton'),
-            ('Apply AI Proposal',self._apply_ai,''),('Save Approved Alignment',self._save,''),('Approve Verse',self._approve,''),('Groups…',self._show_alignment_groups_popup,''),('Restore Backup',self._restore_latest,'')]
-        self.align_toolbar_widgets=[]
-        for text,cmd,sty in specs:
-            kw={'text':text,'command':cmd}
-            if sty: kw['style']=sty
-            b=ttk.Button(self.align_toolbar,**kw); self.align_toolbar_widgets.append(b)
-            if text=='Apply AI Proposal': self.apply_ai_btn=b; b.configure(state='disabled')
-        self._reflow_toolbar(self.align_toolbar,self.align_toolbar_widgets,9)
-        alignment_tips={
-            'Connect':'Connect the selected existing source- and target-language tokens into one alignment group.',
-            'Unalign Target':'Remove the selected target-language token(s) from their current alignment and return them to wordBank.',
-            'Undo':'Undo the most recent in-memory alignment edit.',
-            'Redo':'Redo the most recently undone alignment edit.',
-            'AI Suggest':'Ask AI to prepare an alignment proposal using only the current verse tokens.',
-            'AI Full Review':'Run alignment plus Translation Notes/Words and full verse QA with evidence.',
-            'Apply AI Proposal':'Apply the prepared AI alignment to the editable in-memory alignment. This does not save yet.',
-            'Save Approved Alignment':'Write the human-approved alignment safely to translationCore with backup/validation.',
-            'Approve Verse':'Record final human verse approval after unresolved high-priority findings are cleared.',
-            'Groups…':'Open a larger scrollable viewer of all current alignment groups.',
-            'Restore Backup':'Restore the latest alignment backup using the reversible safety workflow.'}
-        for widget,(text,_,_) in zip(self.align_toolbar_widgets,specs): self._tip(widget,alignment_tips.get(text,''))
+        self.align_toolbar_groups=[]; self.align_toolbar_separators=[]; self.align_toolbar_widgets=[]
+
+        def make_group(specs):
+            frame=ttk.Frame(self.align_toolbar); buttons=[]
+            for col,(text,cmd,sty,tip) in enumerate(specs):
+                b=ttk.Button(frame,text=text,command=cmd,style=sty if sty else 'TButton'); b.grid(row=0,column=col,sticky='ew',padx=2)
+                frame.columnconfigure(col,weight=1); buttons.append(b); self.align_toolbar_widgets.append(b); self._tip(b,tip)
+                if text=='Apply AI Proposal': self.apply_ai_btn=b; b.configure(state='disabled')
+            self.align_toolbar_groups.append(frame); return frame
+
+        make_group([
+            ('Connect',self._connect_selected,'','Manually align the selected existing source and target tokens.'),
+            ('Unalign Target',self._unalign_selected,'','Return selected target token(s) to the unaligned word bank.'),
+            ('Undo',self._undo,'','Undo the most recent in-memory alignment edit.'),
+            ('Redo',self._redo,'','Redo the most recently undone alignment edit.'),
+        ])
+        make_group([
+            ('Fill Alignment Gaps',self._ai_suggest,'Accent.TButton','Ask AI only about unresolved relationships; protected existing alignment remains read-only context.'),
+            ('Audit Existing Alignment',self._audit_existing_alignment,'','Read-only whole-verse AI audit of alignment; existing project alignment stays protected and project data is not modified.'),
+            ('Apply AI Proposal',self._apply_ai,'','Apply the validated deterministic proposal after compiler normalization to the in-memory alignment. Save is still a separate human action.'),
+        ])
+        make_group([
+            ('Save Alignment',self._save,'','Write the human-approved alignment safely with backup and validation.'),
+            ('Approve Verse',self._approve,'','Record final human verse approval after unresolved high-priority findings are cleared.'),
+        ])
+        more_frame=ttk.Frame(self.align_toolbar)
+        more_btn=ttk.Menubutton(more_frame,text='More…'); more_menu=tk.Menu(more_btn,tearoff=False)
+        more_menu.add_command(label='Alignment Diagnostics…',command=self._show_alignment_diagnostics)
+        more_menu.add_command(label='Alignment Groups…',command=self._show_alignment_groups_popup)
+        more_menu.add_separator(); more_menu.add_command(label='Restore Latest Backup',command=self._restore_latest)
+        more_btn.configure(menu=more_menu); more_btn._menu_ref=more_menu; more_btn.grid(row=0,column=0,sticky='ew'); more_frame.columnconfigure(0,weight=1)
+        self.align_toolbar_groups.append(more_frame); self.align_toolbar_widgets.append(more_btn)
+        self._tip(more_btn,'Open less-frequent alignment diagnostics, the large group viewer, or backup restoration.')
+        for _ in range(len(self.align_toolbar_groups)-1):
+            self.align_toolbar_separators.append(ttk.Label(self.align_toolbar,text='|',anchor='center'))
+        self._layout_alignment_toolbar(self._small_screen)
 
         self.align_vertical_pane=ttk.Panedwindow(outer,orient='vertical'); self.align_vertical_pane.grid(row=2,column=0,sticky='nsew')
         work=ttk.Frame(self.align_vertical_pane); preview=ttk.LabelFrame(self.align_vertical_pane,text='AI Proposal · drag divider to resize',padding=4)
@@ -589,15 +763,23 @@ class BridgeApp(tk.Tk):
         outer.rowconfigure(3,weight=1); outer.columnconfigure(0,weight=1)
         self.review_header_toolbar=hdr=ttk.Frame(outer); hdr.grid(row=0,column=0,sticky='ew')
         self.review_header_widgets=[
-            ttk.Button(hdr,text='AI Full Verse Review (F5)',command=self._run_full_review,style='Accent.TButton'),
+            ttk.Button(hdr,text='Prepare tN tW Review',command=self._run_full_review,style='Accent.TButton'),
             ttk.Button(hdr,text='Review Changed Chapter',command=lambda:self._run_chapter_review(force=False),style='Accent.TButton'),
             ttk.Button(hdr,text='Force Chapter Audit',command=lambda:self._run_chapter_review(force=True)),
-            ttk.Button(hdr,text='Next Priority (F8)',command=self._review_next_priority),
+            ttk.Button(hdr,text='Next Priority',command=self._review_next_priority),
             ttk.Button(hdr,text='Low-confidence Audit',command=self._show_suppressed_findings),
             ttk.Checkbutton(hdr,text='Auto-advance',variable=self.fast_review_var,command=lambda:self.settings.set_setting('auto_advance_review',bool(self.fast_review_var.get()))),
         ]
         self._reflow_toolbar(hdr,self.review_header_widgets,5)
-        self.review_summary_var=tk.StringVar(value='Load a verse, then run AI Full Verse Review.')
+        for widget,tip in zip(self.review_header_widgets,[
+            'Prepare Translation Notes/Translation Words selections plus verse-level QA evidence. Human review remains required. Shortcut: F5.',
+            'Prepare only changed/untouched work in the current chapter.',
+            'Force a complete current-chapter audit even when cached work is current.',
+            'Jump to the highest-priority queued exception. Shortcut: F8.',
+            'Inspect findings suppressed from the main queue by the confidence/evidence policy.',
+            'After a human decision, automatically move to the next priority item.',
+        ]): self._tip(widget,tip)
+        self.review_summary_var=tk.StringVar(value='Load a verse, then prepare tN/tW review evidence.')
         self.review_summary_label=ttk.Label(outer,textvariable=self.review_summary_var,wraplength=1250); self.review_summary_label.grid(row=1,column=0,sticky='ew',pady=(5,3))
 
         # Severity summary and tool/result viewer share one aligned grid.
@@ -617,22 +799,24 @@ class BridgeApp(tk.Tk):
         for c in cols: self.review_tree.heading(c,text=c.title())
         self.review_tree.grid(row=0,column=0,sticky='nsew'); y=ttk.Scrollbar(left,orient='vertical',command=self.review_tree.yview); y.grid(row=0,column=1,sticky='ns'); rx=ttk.Scrollbar(left,orient='horizontal',command=self.review_tree.xview); rx.grid(row=1,column=0,sticky='ew'); self.review_tree.configure(yscrollcommand=y.set,xscrollcommand=rx.set)
         self.review_tree.bind('<<TreeviewSelect>>',self._review_selected)
-        self.review_detail=tk.Text(right,wrap='none',font=('Nirmala UI',10)); ds=ttk.Scrollbar(right,orient='vertical',command=self.review_detail.yview); dx=ttk.Scrollbar(right,orient='horizontal',command=self.review_detail.xview); self.review_detail.configure(yscrollcommand=ds.set,xscrollcommand=dx.set)
-        self.review_detail.grid(row=0,column=0,sticky='nsew'); ds.grid(row=0,column=1,sticky='ns'); dx.grid(row=1,column=0,sticky='ew'); self.review_detail.configure(state='disabled')
+        # Result + Evidence contains explanatory prose in several languages. Word wrapping is more
+        # useful than forcing the reviewer to pan horizontally, especially on smaller laptops.
+        self.review_detail=tk.Text(right,wrap='word',font=('Nirmala UI',10)); ds=ttk.Scrollbar(right,orient='vertical',command=self.review_detail.yview); self.review_detail.configure(yscrollcommand=ds.set)
+        self.review_detail.grid(row=0,column=0,sticky='nsew'); ds.grid(row=0,column=1,sticky='ns'); self.review_detail.configure(state='disabled')
         self._tip(self.review_tree,'AI/tC findings. Use the horizontal scrollbar when long selections or group names exceed the available width.')
-        self._tip(self.review_detail,'Selected result and evidence. Both vertical and horizontal scrolling are available for long evidence lines.')
+        self._tip(self.review_detail,'Selected result and evidence. Text wraps automatically; use the vertical scrollbar for longer evidence.')
 
         self.review_actions=decisions=ttk.Frame(outer); decisions.grid(row=4,column=0,sticky='ew',pady=(5,0))
         self.review_action_widgets=[]
-        review_specs=[('Accept · Ctrl+Enter',lambda:self._record_review_decision('accepted')),('Edit Selection',self._edit_review_selection),('Needs Discussion · Ctrl+Shift+D',lambda:self._record_review_decision('needs_discussion')),('Reject AI · Ctrl+Shift+R',lambda:self._record_review_decision('rejected')),('Edit Scripture…',self._edit_scripture_from_review)]
+        review_specs=[('Accept',lambda:self._record_review_decision('accepted')),('Edit Selection',self._edit_review_selection),('Needs Discussion',lambda:self._record_review_decision('needs_discussion')),('Reject AI',lambda:self._record_review_decision('rejected')),('Edit Scripture…',self._edit_scripture_from_review)]
         for text,cmd in review_specs:
             b=ttk.Button(decisions,text=text,command=cmd); self.review_action_widgets.append(b)
         self._reflow_toolbar(decisions,self.review_action_widgets,5)
         review_tips={
-            'Accept · Ctrl+Enter':'Human-accept the selected AI TN/TW result and synchronize the approved selection where applicable.',
+            'Accept':'Human-accept the selected AI TN/TW result and synchronize the approved selection where applicable. Shortcut: Ctrl+Enter.',
             'Edit Selection':'Correct the AI target-language token selection using only tokens that actually exist in the current verse.',
-            'Needs Discussion · Ctrl+Shift+D':'Keep this item unresolved and record it for team/consultant discussion.',
-            'Reject AI · Ctrl+Shift+R':'Reject the selected AI conclusion without marking the underlying check complete.',
+            'Needs Discussion':'Keep this item unresolved and record it for team/consultant discussion. Shortcut: Ctrl+Shift+D.',
+            'Reject AI':'Reject the selected AI conclusion without marking the underlying check complete. Shortcut: Ctrl+Shift+R.',
             'Edit Scripture…':'Open the human Scripture correction workspace with before/after diff and stale propagation.'}
         for widget,(text,_) in zip(self.review_action_widgets,review_specs): self._tip(widget,review_tips[text])
 
@@ -656,12 +840,19 @@ class BridgeApp(tk.Tk):
         self.qa_toolbar=row = ttk.Frame(outer); row.pack(fill='x')
         self.qa_toolbar_widgets=[
             ttk.Button(row, text='Run Local QA', command=self._run_local_qa),
-            ttk.Button(row, text='AI Full Review (F5)', command=self._run_full_review, style='Accent.TButton'),
+            ttk.Button(row, text='AI Full Review', command=self._run_full_review, style='Accent.TButton'),
             ttk.Button(row, text='Edit Scripture…', command=self._edit_scripture_from_qa),
             ttk.Button(row, text='Undo Scripture', command=self._undo_scripture),
             ttk.Button(row, text='Redo Scripture', command=self._redo_scripture),
         ]
         self._reflow_toolbar(row,self.qa_toolbar_widgets,5)
+        for widget,tip in zip(self.qa_toolbar_widgets,[
+            'Run deterministic local QA without calling AI.',
+            'Run the complete AI verse review. Shortcut: F5.',
+            'Open the human Scripture correction workspace.',
+            'Undo the most recent safe human Scripture edit.',
+            'Redo the most recently undone human Scripture edit.',
+        ]): self._tip(widget,tip)
         self.qa_summary_var = tk.StringVar(value='Load a verse, then run QA.')
         self.qa_summary_label=ttk.Label(outer, textvariable=self.qa_summary_var,wraplength=1200); self.qa_summary_label.pack(fill='x',pady=(4,0))
         cols=('severity','source','status','title')
@@ -788,36 +979,619 @@ class BridgeApp(tk.Tk):
 
     def _build_production_tab(self):
         outer=ttk.Frame(self.production_tab,padding=6); outer.pack(fill='both',expand=True)
-        top=ttk.Frame(outer); top.pack(fill='x')
-        ttk.Button(top,text='Refresh Production Status',command=self._refresh_production).pack(side='left')
-        ttk.Button(top,text='Export QA Report…',command=self._export_report,style='Accent.TButton').pack(side='left',padx=4)
-        ttk.Button(top,text='Security Scan',command=self._security_scan).pack(side='left',padx=4)
-        ttk.Button(top,text='Performance Benchmark',command=self._run_performance_benchmark).pack(side='left',padx=4)
-        ttk.Button(top,text='Export Paratext Notes…',command=self._export_paratext_notes).pack(side='left',padx=4)
-        panes=ttk.Panedwindow(outer,orient='horizontal'); panes.pack(fill='both',expand=True,pady=(6,0))
-        left=ttk.Frame(panes); right=ttk.Frame(panes); panes.add(left,weight=1); panes.add(right,weight=1)
-        recovery=ttk.LabelFrame(left,text='Crash recovery / transaction journal',padding=6); recovery.pack(fill='x')
-        self.tx_status_var=tk.StringVar(value='No project loaded'); self.tx_status_label=ttk.Label(recovery,textvariable=self.tx_status_var,wraplength=560); self.tx_status_label.pack(anchor='w')
-        ttk.Button(recovery,text='Recover Incomplete Transactions',command=self._recover_transactions).pack(anchor='w',pady=(5,0))
-        git=ttk.LabelFrame(left,text='Project Git checkpoints',padding=6); git.pack(fill='x',pady=6)
-        self.git_status_var=tk.StringVar(value='No project loaded'); self.git_status_label=ttk.Label(git,textvariable=self.git_status_var,wraplength=560); self.git_status_label.pack(anchor='w')
-        ttk.Button(git,text='Create Human Checkpoint',command=self._git_checkpoint).pack(side='left',pady=(5,0)); ttk.Button(git,text='View Git Diff',command=self._show_git_diff).pack(side='left',padx=4,pady=(5,0))
-        team=ttk.LabelFrame(left,text='Team / reviewer workflow',padding=6); team.pack(fill='x')
-        self.team_role_var=tk.StringVar(value='reviewer'); ttk.Label(team,text='Current reviewer role').grid(row=0,column=0,sticky='w'); ttk.Combobox(team,textvariable=self.team_role_var,state='readonly',values=('translator','reviewer','consultant','administrator'),width=18).grid(row=0,column=1,padx=5); ttk.Button(team,text='Save Role',command=self._save_team_role).grid(row=0,column=2)
-        self.team_status_var=tk.StringVar(value=''); self.team_status_label=ttk.Label(team,textvariable=self.team_status_var,wraplength=550); self.team_status_label.grid(row=1,column=0,columnspan=3,sticky='w',pady=(5,0))
+        self.production_toolbar=ttk.Frame(outer); self.production_toolbar.pack(fill='x')
+        self.production_toolbar_widgets=[]
+        for text,cmd,accent in [
+            ('Refresh',self._refresh_production,False),
+            ('Export QA Report…',self._export_report,True),
+            ('Existing Work Scan',self._show_compatibility_scan,False),
+        ]:
+            btn=ttk.Button(self.production_toolbar,text=text,command=cmd,style='Accent.TButton' if accent else 'TButton')
+            self.production_toolbar_widgets.append(btn)
+        diagnostics_btn=ttk.Menubutton(self.production_toolbar,text='Diagnostics…')
+        diagnostics_menu=tk.Menu(diagnostics_btn,tearoff=False)
+        diagnostics_menu.add_command(label='Security Scan',command=self._security_scan)
+        diagnostics_menu.add_command(label='Performance Benchmark',command=self._run_performance_benchmark)
+        diagnostics_btn.configure(menu=diagnostics_menu); diagnostics_btn._menu_ref=diagnostics_menu
+        self.production_toolbar_widgets.append(diagnostics_btn)
+
+        shell=ttk.Frame(outer); shell.pack(fill='both',expand=True,pady=(6,0)); shell.rowconfigure(0,weight=1); shell.columnconfigure(0,weight=1)
+        self.production_scroll_canvas=tk.Canvas(shell,highlightthickness=0,borderwidth=0)
+        try:self.production_scroll_canvas.configure(background=self.cget('background'))
+        except Exception:pass
+        pscroll=ttk.Scrollbar(shell,orient='vertical',command=self.production_scroll_canvas.yview)
+        self.production_scroll_canvas.configure(yscrollcommand=pscroll.set)
+        self.production_scroll_canvas.grid(row=0,column=0,sticky='nsew'); pscroll.grid(row=0,column=1,sticky='ns')
+        self.production_body=ttk.Frame(self.production_scroll_canvas)
+        self._production_canvas_window=self.production_scroll_canvas.create_window((0,0),window=self.production_body,anchor='nw')
+        self.production_body.bind('<Configure>',lambda e:self.production_scroll_canvas.configure(scrollregion=self.production_scroll_canvas.bbox('all')))
+        self.production_scroll_canvas.bind('<Configure>',lambda e:self.production_scroll_canvas.itemconfigure(self._production_canvas_window,width=max(1,e.width)))
+
+        self.production_left=ttk.Frame(self.production_body); self.production_right=ttk.Frame(self.production_body)
+
+        sec=_CollapsibleSection(self.production_left,'Crash recovery / transaction journal',self.settings,'production.recovery',expanded=True); sec.pack(fill='x'); recovery=sec.body
+        self.tx_status_var=tk.StringVar(value='No project loaded'); self.tx_status_label=ttk.Label(recovery,textvariable=self.tx_status_var,wraplength=560); self.tx_status_label.pack(anchor='w',fill='x')
+        recover_btn=ttk.Button(recovery,text='Recover Incomplete Transactions',command=self._recover_transactions); recover_btn.pack(anchor='w',pady=(5,0))
+        self._tip(recover_btn,'Roll back incomplete journaled writes to their safe pre-write backups. This is used only after an interrupted transaction.')
+
+        sec=_CollapsibleSection(self.production_left,'Project Git checkpoints',self.settings,'production.git',expanded=False); sec.pack(fill='x',pady=(6,0)); git=sec.body
+        self.git_status_var=tk.StringVar(value='No project loaded'); self.git_status_label=ttk.Label(git,textvariable=self.git_status_var,wraplength=560); self.git_status_label.pack(anchor='w',fill='x')
+        grow=ttk.Frame(git); grow.pack(fill='x',pady=(5,0)); grow.columnconfigure((0,1),weight=1)
+        checkpoint=ttk.Button(grow,text='Create Human Checkpoint',command=self._git_checkpoint); checkpoint.grid(row=0,column=0,sticky='ew',padx=(0,2))
+        diff=ttk.Button(grow,text='View Git Diff',command=self._show_git_diff); diff.grid(row=0,column=1,sticky='ew',padx=(2,0))
+        self._tip(checkpoint,'Create an explicit Git checkpoint for current human-reviewed project state when Git is available.')
+        self._tip(diff,'View current Git changes without modifying project files.')
+
+        sec=_CollapsibleSection(self.production_left,'Team / reviewer workflow',self.settings,'production.team',expanded=False); sec.pack(fill='x',pady=(6,0)); team=sec.body
+        team.columnconfigure(1,weight=1)
+        self.team_role_var=tk.StringVar(value='reviewer'); ttk.Label(team,text='Current reviewer role').grid(row=0,column=0,sticky='w')
+        ttk.Combobox(team,textvariable=self.team_role_var,state='readonly',values=('translator','reviewer','consultant','administrator'),width=18).grid(row=0,column=1,padx=5,sticky='ew')
+        role_btn=ttk.Button(team,text='Save Role',command=self._save_team_role); role_btn.grid(row=0,column=2)
+        self.team_status_var=tk.StringVar(value=''); self.team_status_label=ttk.Label(team,textvariable=self.team_status_var,wraplength=550); self.team_status_label.grid(row=1,column=0,columnspan=3,sticky='ew',pady=(5,0))
         ttk.Label(team,text='Current verse assignee').grid(row=2,column=0,sticky='w',pady=(6,0))
-        self.assignee_var=tk.StringVar(value=self.settings.reviewer_name); ttk.Entry(team,textvariable=self.assignee_var,width=24).grid(row=2,column=1,sticky='w',padx=5,pady=(6,0))
-        ttk.Button(team,text='Assign',command=self._assign_current_verse).grid(row=2,column=2,pady=(6,0))
-        ptn=ttk.LabelFrame(left,text='Paratext-compatible reviewer notes',padding=6); ptn.pack(fill='x',pady=(6,0))
-        self.paratext_notes_var=tk.StringVar(value='Reviewer discussion comments are stored as Paratext Notes 1.1-compatible XML.')
-        self.paratext_notes_label=ttk.Label(ptn,textvariable=self.paratext_notes_var,wraplength=550); self.paratext_notes_label.pack(anchor='w')
-        ttk.Button(ptn,text='Export Notes XML…',command=self._export_paratext_notes).pack(anchor='w',pady=(5,0))
-        metrics=ttk.LabelFrame(right,text='Quality / speed / cost metrics',padding=6); metrics.pack(fill='both',expand=True)
+        self.assignee_var=tk.StringVar(value=self.settings.reviewer_name); ttk.Entry(team,textvariable=self.assignee_var,width=24).grid(row=2,column=1,sticky='ew',padx=5,pady=(6,0))
+        assign_btn=ttk.Button(team,text='Assign',command=self._assign_current_verse); assign_btn.grid(row=2,column=2,pady=(6,0))
+        self._tip(role_btn,'Save the reviewer role used by the Bridge team workflow.'); self._tip(assign_btn,'Assign the current verse to the named reviewer in Bridge workflow metadata.')
+
+        sec=_CollapsibleSection(self.production_left,'Paratext · Live Connector + Project Notes',self.settings,'production.paratext',expanded=True); sec.pack(fill='x',pady=(6,0)); localpt=sec.body
+        self.paratext_connector_var=tk.StringVar(value='○ Not connected · Start Paratext, then Connect / Refresh.')
+        self.paratext_connector_label=ttk.Label(localpt,textvariable=self.paratext_connector_var,wraplength=550,justify='left'); self.paratext_connector_label.pack(anchor='w',fill='x')
+        self.paratext_selection_var=tk.StringVar(value='Selection: —')
+        self.paratext_selection_label=ttk.Label(localpt,textvariable=self.paratext_selection_var,wraplength=550,justify='left'); self.paratext_selection_label.pack(anchor='w',fill='x',pady=(3,0))
+        self.paratext_notes_var=tk.StringVar(value='Reviewer notes: none yet · Paratext uses the real logged-in user; AI Suggestion is retained as source provenance.')
+        self.paratext_notes_label=ttk.Label(localpt,textvariable=self.paratext_notes_var,wraplength=550,justify='left'); self.paratext_notes_label.pack(anchor='w',fill='x',pady=(3,0))
+        self.paratext_actions=ttk.Frame(localpt); self.paratext_actions.pack(fill='x',pady=(6,1))
+        connect_btn=ttk.Button(self.paratext_actions,text='Connect / Refresh',command=self._probe_paratext_connector)
+        verify_btn=ttk.Button(self.paratext_actions,text='Verify / Bind Project',command=self._verify_paratext_project)
+        sync_btn=ttk.Button(self.paratext_actions,text='Sync Notes',command=self._sync_paratext_notes,style='Accent.TButton')
+        export_btn=ttk.Button(self.paratext_actions,text='Export Notes XML…',command=self._export_paratext_notes)
+        self.paratext_action_widgets=[connect_btn,verify_btn,sync_btn,export_btn]
+        nav_cb=ttk.Checkbutton(localpt,text='Sync verse navigation',variable=self.paratext_nav_sync_var,command=self._toggle_paratext_nav_sync); nav_cb.pack(anchor='w',pady=(5,0))
+        live_cb=ttk.Checkbutton(localpt,text='Auto-send review notes',variable=self.paratext_live_review_notes_var); live_cb.pack(anchor='w')
+        self.paratext_versification_note=ttk.Label(localpt,text='Navigation safety: Paratext resolves references with the active project versification. Cross-application sync is reference-label based; verify versification-sensitive passages.',wraplength=550,justify='left')
+        self.paratext_versification_note.pack(anchor='w',fill='x',pady=(4,0))
+        self._tip(connect_btn,'Read the current Paratext user, project, reference and selection from the local connector.')
+        self._tip(verify_btn,'Verify or explicitly bind this translationCore project to the active Paratext project before live navigation or notes.')
+        self._tip(sync_btn,'Create pending Bridge reviewer notes as Paratext Project Notes through the local Plugin API.')
+        self._tip(export_btn,'Export an API-ready Notes 1.1 XML backup. Notes_AI_Suggestion.xml is a filename, not a Paratext user.')
+        self._tip(nav_cb,'Allow navigation to originate in the Bridge or Paratext. Changes are routed through the Bridge navigation broker with echo protection.')
+        self._tip(live_cb,'Also send Needs Discussion / Reject AI comments to live Paratext Project Notes. Bridge audit history remains authoritative locally.')
+
+        sec=_CollapsibleSection(self.production_left,'Logos · Live Verse Navigation',self.settings,'production.logos',expanded=True); sec.pack(fill='x',pady=(6,0)); logos=sec.body
+        self.logos_status_var=tk.StringVar(value='○ Not connected · Start Logos Desktop, then Connect / Refresh.')
+        self.logos_status_label=ttk.Label(logos,textvariable=self.logos_status_var,wraplength=550,justify='left'); self.logos_status_label.pack(anchor='w',fill='x')
+        self.logos_actions=ttk.Frame(logos); self.logos_actions.pack(fill='x',pady=(6,1))
+        logos_connect=ttk.Button(self.logos_actions,text='Connect / Refresh',command=self._probe_logos_connector)
+        self.logos_action_widgets=[logos_connect]
+        logos_nav=ttk.Checkbutton(logos,text='Sync verse navigation',variable=self.logos_nav_sync_var,command=self._toggle_logos_nav_sync); logos_nav.pack(anchor='w',pady=(5,0))
+        self.logos_versification_note=ttk.Label(logos,text='Navigation safety: Logos and Paratext may use different versifications. The Bridge synchronizes the reference label and fails closed on detectable reference mismatches.',wraplength=550,justify='left')
+        self.logos_versification_note.pack(anchor='w',fill='x',pady=(4,0))
+        self._tip(logos_connect,'Connect to the running Windows Logos desktop application through its local COM API and read the current Bible reference.')
+        self._tip(logos_nav,'Enable any-direction verse navigation between Logos, the Bridge and—when enabled—Paratext. Echoes and duplicate events are suppressed.')
+
+        sec=_CollapsibleSection(self.production_right,'Quality / speed / cost metrics',self.settings,'production.metrics',expanded=True); sec.pack(fill='both',expand=True); metrics=sec.body
         metrics.rowconfigure(0,weight=1); metrics.columnconfigure(0,weight=1)
         self.metrics_text=tk.Text(metrics,height=15,wrap='none',font=('Consolas',9)); mty=ttk.Scrollbar(metrics,orient='vertical',command=self.metrics_text.yview); mtx=ttk.Scrollbar(metrics,orient='horizontal',command=self.metrics_text.xview); self.metrics_text.configure(yscrollcommand=mty.set,xscrollcommand=mtx.set)
         self.metrics_text.grid(row=0,column=0,sticky='nsew'); mty.grid(row=0,column=1,sticky='ns'); mtx.grid(row=1,column=0,sticky='ew'); self.metrics_text.configure(state='disabled')
-        plugins=ttk.LabelFrame(right,text='Language/plugin architecture',padding=6); plugins.pack(fill='x',pady=(6,0))
-        self.plugins_var=tk.StringVar(value=''); self.plugins_label=ttk.Label(plugins,textvariable=self.plugins_var,wraplength=560); self.plugins_label.pack(anchor='w')
+        sec=_CollapsibleSection(self.production_right,'Language / plugin architecture',self.settings,'production.plugins',expanded=False); sec.pack(fill='x',pady=(6,0)); plugins=sec.body
+        self.plugins_var=tk.StringVar(value=''); self.plugins_label=ttk.Label(plugins,textvariable=self.plugins_var,wraplength=560); self.plugins_label.pack(anchor='w',fill='x')
+
+        self._reflow_toolbar(self.production_toolbar,self.production_toolbar_widgets,4)
+        self._reflow_toolbar(self.paratext_actions,self.paratext_action_widgets,4)
+        self._reflow_toolbar(self.logos_actions,self.logos_action_widgets,1)
+        self._layout_production_columns(self._small_screen)
+    def _layout_production_columns(self, stacked: bool):
+        """Reflow Production into one column on small screens; the page remains scrollable."""
+        if not hasattr(self,'production_body'):return
+        try:
+            self.production_left.grid_forget(); self.production_right.grid_forget()
+            for c in (0,1): self.production_body.columnconfigure(c,weight=0)
+            if stacked:
+                self.production_body.columnconfigure(0,weight=1)
+                self.production_left.grid(row=0,column=0,sticky='nsew')
+                self.production_right.grid(row=1,column=0,sticky='nsew',pady=(6,0))
+            else:
+                self.production_body.columnconfigure(0,weight=1); self.production_body.columnconfigure(1,weight=1)
+                self.production_left.grid(row=0,column=0,sticky='nsew',padx=(0,3))
+                self.production_right.grid(row=0,column=1,sticky='nsew',padx=(3,0))
+        except tk.TclError:
+            pass
+
+    def _show_compatibility_scan(self):
+        if not self.project:return
+        project=self.project
+        def success(scan):
+            if self.project is not project:return
+            lines=[
+                f"EXISTING WORK COMPATIBILITY SCAN — {scan.get('bookId','').upper()}", '',
+                f"Verses: {scan.get('verses',0)}",
+                f"Human-approved hard locks: {scan.get('hardLocked',0)}",
+                f"Protected legacy completed work: {scan.get('protectedLegacy',0)}",
+                f"Partial protected work: {scan.get('partialProtected',0)}",
+                f"Open/untouched: {scan.get('open',0)}",
+                f"Stale after verse edit: {scan.get('stale',0)}",
+                f"Structural review exceptions: {scan.get('structuralReview',0)}",
+                f"Malformed/unreadable: {scan.get('malformed',0)}", '',
+                'Files modified by this scan: NONE', '',
+                'EXCEPTIONS'
+            ]
+            for item in scan.get('exceptions',[])[:500]:
+                lines.append(f"{item.get('chapter')}:{item.get('verse')} · {item.get('lock')}" + (' · STALE' if item.get('stale') else ''))
+                for issue in item.get('issues',[]): lines.append('  • '+str(issue))
+            win=tk.Toplevel(self); win.title('Existing Work Compatibility Scan'); win.geometry('900x700'); win.transient(self)
+            h=ttk.Frame(win,padding=8); h.pack(fill='both',expand=True); h.rowconfigure(0,weight=1); h.columnconfigure(0,weight=1)
+            t=tk.Text(h,wrap='word',font=('Consolas',9)); sy=ttk.Scrollbar(h,orient='vertical',command=t.yview); t.configure(yscrollcommand=sy.set); t.grid(row=0,column=0,sticky='nsew'); sy.grid(row=0,column=1,sticky='ns'); t.insert('1.0','\n'.join(lines)); t.configure(state='disabled')
+            ttk.Button(h,text='Close',command=win.destroy).grid(row=1,column=0,sticky='e',pady=(6,0)); self._end_job('Compatibility scan complete — read only')
+        self._background('Scanning existing alignment compatibility',project.alignment_compatibility_scan,success,determinate=False,ai_operation=False)
+
+    def _resource_path(self, relative: str) -> Path:
+        base=Path(getattr(sys,'_MEIPASS',Path(__file__).resolve().parent.parent))
+        candidate=base/relative
+        if candidate.exists(): return candidate
+        return Path(__file__).resolve().parent.parent/relative
+
+    def _live_paratext_binding(self, state=None):
+        if not self.project:
+            return '', 'no_translationcore_project'
+        bound=(self.settings.get_paratext_project_guid(self._paratext_project_key()) or '').strip()
+        active=(getattr(state,'project_id','') or '').strip() if state is not None else ''
+        if not bound:
+            return '', 'unbound'
+        if active and bound.lower()!=active.lower():
+            return bound, 'mismatch'
+        return bound, 'matched'
+
+    def _paratext_state_text(self, state) -> str:
+        if not state:return '○ Not connected'
+        version=f' · Paratext {state.paratext_version}' if state.paratext_version else ''
+        plugin=f' · Connector {state.plugin_version}' if state.plugin_version else ''
+        group=f' · Group {state.sync_group}' if state.sync_group else ''
+        _,binding=self._live_paratext_binding(state)
+        binding_text={'matched':'Bound ✓','unbound':'Not bound','mismatch':'PROJECT MISMATCH','no_translationcore_project':'No tC project'}.get(binding,binding)
+        return f"● Connected{version}{plugin}\nUser: {state.user or '—'} · Project: {state.project_name or state.project_id or '—'} · Reference: {state.reference or '—'}{group}\nBridge binding: {binding_text}"
+
+    def _update_paratext_connector_display(self, state=None, error: str=''):
+        if error:
+            if hasattr(self,'paratext_connector_var'): self.paratext_connector_var.set('○ Not connected · '+error)
+            if hasattr(self,'paratext_selection_var'): self.paratext_selection_var.set('Selection: —')
+            return
+        if state is None:return
+        if hasattr(self,'paratext_connector_var'): self.paratext_connector_var.set(self._paratext_state_text(state))
+        selection=(state.selected_text or '').strip()
+        ref=state.selection_reference or state.reference or '—'
+        preview=selection if len(selection)<=180 else selection[:177]+'…'
+        if hasattr(self,'paratext_selection_var'): self.paratext_selection_var.set(f"Selection ({ref}): {preview or '—'}")
+
+    def _probe_paratext_connector(self, silent=False):
+        try:
+            state=self.paratext_connector.get_state(); self.paratext_connector_state=state
+            self._update_paratext_connector_display(state)
+            # The Plugin API gives us the actual current Paratext identity. Surface it in Settings
+            # immediately, but persist it only when the reviewer explicitly verifies/binds the
+            # project. This avoids treating a made-up AI label as a Paratext member account.
+            if (state.user or '').strip() and hasattr(self,'paratext_username_var'):
+                self.paratext_username_var.set(state.user.strip())
+            if self.paratext_nav_sync_var.get(): self._schedule_paratext_poll()
+            if not silent: messagebox.showinfo('Paratext Live Connector',self._paratext_state_text(state))
+            return state
+        except Exception as e:
+            self.paratext_connector_state=None
+            self._update_paratext_connector_display(error=str(e))
+            if not silent: messagebox.showinfo('Paratext Live Connector',str(e)+'\n\nIf the connector is not installed, close Paratext and use Settings & Log → Install / Update Connector… first.')
+            return None
+
+    def _paratext_note_user(self, state=None, *, allow_reviewer_fallback=True) -> str:
+        """Return the real Paratext user when available; reviewer fallback is local-only."""
+        live=state or self.paratext_connector_state
+        user=(getattr(live,'user','') or '').strip() if live is not None else ''
+        if user:
+            return user
+        configured=(self.settings.paratext_username or '').strip()
+        if configured:
+            return configured
+        return (self.settings.reviewer_name or '').strip() if allow_reviewer_fallback else ''
+
+    def _install_paratext_connector(self):
+        installer=self._resource_path('paratext_connector/install_paratext_connector.bat')
+        if not installer.exists():
+            messagebox.showerror('Paratext Connector','The connector installer is missing from this build.\n\nExpected:\n'+str(installer)); return
+        if not messagebox.askokcancel('Install Paratext Connector','Close Paratext completely before installing or updating the connector.\n\nThe installer will compile the plugin against your installed Paratext 9.5 PluginInterfaces and may request Windows administrator permission to copy it into the Paratext plugins folder.\n\nContinue?'):
+            return
+        try:
+            if os.name!='nt': raise RuntimeError('The Paratext connector installer is Windows-only.')
+            os.startfile(str(installer))
+            self.set_status('Paratext connector installer opened. Restart Paratext after it reports success.')
+        except Exception as e: messagebox.showerror('Paratext Connector',str(e))
+
+    def _bind_active_paratext_project(self):
+        if not self.project:
+            messagebox.showwarning('Paratext Project Binding','Load a translationCore project first.'); return
+        state=self._probe_paratext_connector(silent=True)
+        if not state:return
+        if not (state.project_id or '').strip():
+            messagebox.showwarning('Paratext Project Binding','Open a Scripture project window in Paratext first.'); return
+        key=self._paratext_project_key()
+        current=self.settings.get_paratext_project_guid(key) or ''
+        prompt=(f"Bind the current translationCore project\n\n{self.project.name or self.project.book_id} ({self.project.book_id.upper()})\n\nto the active Paratext project\n\n{state.project_name or '—'}\nID: {state.project_id}\nUser: {state.user or '—'}?\n\nThis binding is a safety check for live navigation and Project Notes. It does not modify Scripture.")
+        if current and current.lower()!=state.project_id.lower():
+            prompt=f"This translationCore project is currently bound to Paratext project ID:\n{current}\n\n"+prompt+"\n\nReplace the old binding?"
+        if not messagebox.askyesno('Paratext Project Binding',prompt):return
+        self.settings.set_paratext_project_guid(key,state.project_id)
+        if (state.user or '').strip():
+            self.settings.paratext_username=state.user.strip()
+            if hasattr(self,'paratext_username_var'): self.paratext_username_var.set(state.user.strip())
+        self._update_paratext_connector_display(state)
+        self.set_status(f'Bound {self.project.book_id.upper()} to Paratext {state.project_name or state.project_id}.')
+
+    def _require_live_paratext_binding(self, state):
+        bound,status=self._live_paratext_binding(state)
+        if status=='unbound':
+            raise ParatextConnectorError('This translationCore project is not yet bound to the active Paratext project. Use Verify / Bind Project first.')
+        if status=='mismatch':
+            raise ParatextConnectorError(f'Paratext project mismatch. This translationCore project is bound to {bound}, but the active Paratext project is {state.project_id}. Open the correct Paratext project or re-bind explicitly.')
+        if status=='no_translationcore_project':
+            raise ParatextConnectorError('Load a translationCore project before using live Paratext actions.')
+        return bound
+
+    def _create_live_paratext_note(self):
+        state=self._probe_paratext_connector(silent=True)
+        if not state:return
+        ref=(state.selection_reference or state.reference or '').strip().upper()
+        if not ref:
+            messagebox.showwarning('Paratext Live Note','Open a Scripture verse in Paratext first.'); return
+        comment=simpledialog.askstring('Paratext Live Note','Reviewer note for the current Paratext selection / verse:',parent=self)
+        if not comment:return
+        selected=(state.selected_text or '').strip()
+        self._send_live_paratext_note(comment,selected,reference=ref,state=state,show_success=True)
+
+    def _send_live_paratext_note(self, comment: str, selected_text: str='', *, reference: str='', state=None, show_success=False):
+        if not comment:return False
+        try:
+            state=state or self.paratext_connector.get_state()
+            self._require_live_paratext_binding(state)
+            ref=(reference or (f"{self.project.book_id.upper()} {self.chapter_var.get()}:{self.verse_var.get()}" if self.project else '')).strip().upper()
+            if not ref: raise ParatextConnectorError('No Scripture reference is available for the live note.')
+            active_ref=(state.reference or '').strip().upper()
+            if active_ref and active_ref!=ref:
+                raise ParatextConnectorError(f'Paratext is at {active_ref}, while this Bridge review belongs to {ref}. Navigate/synchronize first; the note was not sent.')
+            result=self.paratext_connector.create_note(
+                ref,selected_text or '',comment,self.assignee_var.get().strip() if hasattr(self,'assignee_var') else '',
+                project_id=state.project_id,before_context=state.before_context,after_context=state.after_context)
+            self.paratext_connector_state=self.paratext_connector.get_state()
+            self._update_paratext_connector_display(self.paratext_connector_state)
+            self.log(f'Live Paratext Project Note created: {ref} · selection={selected_text!r}')
+            if show_success: messagebox.showinfo('Paratext Live Note',str(result.get('message') or f'Project Note created at {ref}.'))
+            return True
+        except Exception as e:
+            self.log(f'Live Paratext note not sent: {e}')
+            if show_success: messagebox.showerror('Paratext Live Note',str(e))
+            else: messagebox.showwarning('Paratext Live Note','The Bridge decision was saved locally, but the live Paratext note was not created:\n\n'+str(e))
+            return False
+
+    def _navigation_context_token(self) -> str:
+        """State that can make a previously rejected external destination retryable."""
+        current_path=str(getattr(getattr(self,'project',None),'path','') or '')
+        dirty='1' if bool(getattr(getattr(self,'session',None),'dirty',False)) else '0'
+        projects=[]
+        for p in getattr(self,'projects',[]) or []:
+            projects.append(f"{getattr(p,'book_id','')}:{getattr(p,'path','')}")
+        return '|'.join((current_path,self._current_bridge_reference(),dirty,';'.join(sorted(projects))))
+
+    def _acquire_navigation_owner(self) -> bool:
+        if self._navigation_owner.owned or self._navigation_owner.acquire():
+            return True
+        messagebox.showwarning(
+            'Verse synchronization',
+            'Another translationCore AI Bridge window currently owns Paratext/Logos verse synchronization.\n\n'
+            'This window can continue normal review work, but external navigation cannot be enabled until the other Bridge releases it.'
+        )
+        return False
+
+    def _release_navigation_owner_if_unused(self) -> None:
+        if not self.paratext_nav_sync_var.get() and not self.logos_nav_sync_var.get():
+            self._navigation_owner.release()
+
+    def _handle_external_navigation_event(self, event) -> bool:
+        if event is None:
+            return False
+        success=self._navigate_from_external(event.reference,event.origin)
+        if success:
+            self.navigation_broker.commit_event(event)
+        else:
+            self.navigation_broker.reject_event(
+                event, self._current_bridge_reference(), context=self._navigation_context_token()
+            )
+        return bool(success)
+
+    def _toggle_paratext_nav_sync(self):
+        if self.paratext_nav_sync_var.get():
+            state=self._probe_paratext_connector(silent=True)
+            if state:
+                try:self._require_live_paratext_binding(state)
+                except Exception as e:
+                    self.paratext_nav_sync_var.set(False); self._release_navigation_owner_if_unused(); messagebox.showwarning('Paratext navigation',str(e)); return
+                if (state.sync_group or '').lower() in ('','none'):
+                    self.paratext_nav_sync_var.set(False); self._release_navigation_owner_if_unused()
+                    messagebox.showwarning('Paratext navigation','The active Paratext window is not in a scroll/sync group. Put it in group A-E, then enable synchronization.'); return
+                if not self._acquire_navigation_owner():
+                    self.paratext_nav_sync_var.set(False); return
+                self.navigation_broker.clear_rejection('paratext')
+                self.navigation_broker.observe_state('paratext',getattr(state,'reference','') or '')
+                self._sync_current_reference_to_paratext(); self._schedule_paratext_poll()
+            else:
+                self.paratext_nav_sync_var.set(False); self._release_navigation_owner_if_unused()
+        else:
+            if self._paratext_poll_after_id:
+                try:self.after_cancel(self._paratext_poll_after_id)
+                except tk.TclError:pass
+                self._paratext_poll_after_id=None
+            self._release_navigation_owner_if_unused()
+
+    def _schedule_paratext_poll(self):
+        if not self.paratext_nav_sync_var.get() or self._closing:return
+        if self._paratext_poll_after_id:
+            try:self.after_cancel(self._paratext_poll_after_id)
+            except tk.TclError:pass
+        self._paratext_poll_after_id=self.after(900,self._poll_paratext_reference)
+
+    def _poll_paratext_reference(self):
+        self._paratext_poll_after_id=None
+        if not self.paratext_nav_sync_var.get() or self._closing:return
+        try:
+            state=self.paratext_connector.get_state(); self.paratext_connector_state=state
+            self._update_paratext_connector_display(state); self._require_live_paratext_binding(state)
+            ref=normalize_reference(state.reference or '')
+            # Retain the connector's own origin-id check and add broker-level recent-outbound
+            # suppression so Paratext cannot bounce a Bridge/Logos event back into the cycle.
+            connector_echo=(state.last_event=='reference_set_by_bridge' and state.last_origin_id and state.last_origin_id==self._last_paratext_origin_id)
+            if ref and not connector_echo:
+                event=self.navigation_broker.new_event(ref,'paratext',context=self._navigation_context_token())
+                if event:self._handle_external_navigation_event(event)
+        except Exception as e:
+            self._update_paratext_connector_display(error=str(e))
+        self._schedule_paratext_poll()
+
+    def _current_bridge_reference(self) -> str:
+        if not self.project or not self.chapter_var.get() or not self.verse_var.get(): return ''
+        return normalize_reference(f"{self.project.book_id.upper()} {self.chapter_var.get()}:{self.verse_var.get()}")
+
+    def _sync_current_reference_to_paratext(self):
+        if self._navigation_suppress_broadcast or self._navigation_origin=='paratext':return
+        if not self.paratext_nav_sync_var.get():return
+        ref=self._current_bridge_reference()
+        if not ref:return
+        state=self.paratext_connector_state
+        if state is not None:
+            try:self._require_live_paratext_binding(state)
+            except Exception as e:
+                self._update_paratext_connector_display(error='Navigation sync paused · '+str(e)); return
+        origin=self.navigation_broker.record_outbound('paratext',ref)
+        self._last_paratext_sent_ref=ref; self._last_paratext_origin_id=origin
+        try:
+            result=self.paratext_connector.set_reference(ref,origin_id=origin)
+            # Paratext resolves through its project versification. If it immediately reports a
+            # different reference label, stop rather than silently synchronizing unlike locations.
+            actual=normalize_reference(result.get('reference','')) if isinstance(result,dict) else ''
+            if actual and actual!=ref:
+                self.paratext_nav_sync_var.set(False); self._release_navigation_owner_if_unused()
+                self._update_paratext_connector_display(error=f'Versification safety stop · requested {ref}, Paratext resolved {actual}. Verify project versification before re-enabling sync.')
+        except Exception as e:self._update_paratext_connector_display(error='Navigation sync paused · '+str(e))
+
+    def _navigate_from_paratext(self, reference: str):
+        # Compatibility wrapper retained for older tests/callers.
+        self._navigate_from_external(reference,'paratext')
+
+    def _logos_state_text(self, state) -> str:
+        if state is None:
+            return '○ Not connected · Start Logos Desktop, then Connect / Refresh.'
+        if getattr(state,'detected',False) and not getattr(state,'navigation_ready',False):
+            api=f' · COM API {state.api_version}' if state.api_version else ''
+            detail=(getattr(state,'message','') or 'Logos is running, but the verse-navigation COM interfaces are not ready.')
+            return f"⚠ Logos detected · Navigation unavailable{api}\n{detail}"
+        if not state.connected:
+            detail=(getattr(state,'message','') or 'Start Logos Desktop, then Connect / Refresh.')
+            return '○ Not connected · '+detail
+        api=f' · COM API {state.api_version}' if state.api_version else ''
+        panel=f"\nPanel: {state.panel_title or state.panel_kind or '—'}" if (state.panel_title or state.panel_kind) else ''
+        ref=state.reference or state.rendered_reference or '—'
+        detail=('\n'+state.message) if getattr(state,'message','') and not state.reference else ''
+        return f"● Connected · Navigation ready · Logos Desktop{api}\nReference: {ref}{panel}{detail}"
+
+    def _update_logos_connector_display(self, state=None, error: str=''):
+        if error:
+            text='○ Not connected · '+str(error)
+        else:
+            text=self._logos_state_text(state)
+        if hasattr(self,'logos_status_var'): self.logos_status_var.set(text)
+        if hasattr(self,'logos_settings_status_var'): self.logos_settings_status_var.set(text)
+
+    def _probe_logos_connector(self, silent=False):
+        try:
+            state=self.logos_connector.get_state(); self.logos_connector_state=state
+            self._update_logos_connector_display(state)
+            if self.logos_nav_sync_var.get():self._schedule_logos_poll()
+            if not silent:messagebox.showinfo('Logos Live Navigation',self._logos_state_text(state))
+            return state
+        except Exception as e:
+            self.logos_connector_state=None; self._update_logos_connector_display(error=str(e))
+            if not silent:messagebox.showinfo('Logos Live Navigation',str(e)+'\n\nStart Logos Desktop on Windows. Logos live navigation uses the locally registered Logos COM API; no Logos credentials are required.')
+            return None
+
+    def _toggle_logos_nav_sync(self):
+        enabled=bool(self.logos_nav_sync_var.get())
+        if enabled:
+            state=self._probe_logos_connector(silent=True)
+            if state is None or not state.connected or not getattr(state,'navigation_ready',False):
+                self.logos_nav_sync_var.set(False); self._release_navigation_owner_if_unused()
+                detail=self._logos_state_text(state) if state is not None else 'Logos Desktop is not running or ready.'
+                messagebox.showwarning('Logos navigation',detail+'\n\nOpen Logos and a Bible resource, then use Connect / Refresh.'); return
+            if not self._acquire_navigation_owner():
+                self.logos_nav_sync_var.set(False); return
+            self.navigation_broker.clear_rejection('logos')
+            self.navigation_broker.observe_state('logos',getattr(state,'reference','') or '')
+            self._sync_current_reference_to_logos(); self._schedule_logos_poll()
+        else:
+            if self._logos_poll_after_id:
+                try:self.after_cancel(self._logos_poll_after_id)
+                except tk.TclError:pass
+                self._logos_poll_after_id=None
+            self._release_navigation_owner_if_unused()
+
+    def _schedule_logos_poll(self):
+        if not self.logos_nav_sync_var.get() or self._closing:return
+        if self._logos_poll_after_id:
+            try:self.after_cancel(self._logos_poll_after_id)
+            except tk.TclError:pass
+        self._logos_poll_after_id=self.after(650,self._poll_logos_reference)
+
+    def _poll_logos_reference(self):
+        """Poll Logos without blocking Tk; a COM timeout must never freeze the reviewer UI."""
+        self._logos_poll_after_id=None
+        if not self.logos_nav_sync_var.get() or self._closing:return
+        async_state=self._logos_async_state
+        with self._logos_nav_lock:
+            if async_state['poll_inflight'] or async_state['nav_worker_running']:
+                self._schedule_logos_poll(); return
+            async_state['poll_inflight']=True
+        out=self._logos_async_queue; connector=self.logos_connector
+        def poll_worker():
+            try: out.put(('poll',connector.get_state(),''))
+            except Exception as e: out.put(('poll',None,str(e)))
+        t=threading.Thread(target=poll_worker,name='LogosStatePoll',daemon=True); t.start()
+
+    def _queue_logos_navigation(self, ref: str, origin_id: str):
+        """Coalesce rapid Bridge/Paratext navigation into a single latest Logos target."""
+        async_state=self._logos_async_state
+        with self._logos_nav_lock:
+            async_state['pending_nav']=(ref,origin_id)
+            if async_state['nav_worker_running']:return
+            async_state['nav_worker_running']=True
+        out=self._logos_async_queue; connector=self.logos_connector; lock=self._logos_nav_lock
+        def nav_worker():
+            try:
+                while True:
+                    with lock:
+                        item=async_state['pending_nav']; async_state['pending_nav']=None
+                        if item is None:
+                            async_state['nav_worker_running']=False; break
+                    target,oid=item
+                    try: out.put(('navigate',target,connector.set_reference(target,origin_id=oid),''))
+                    except Exception as e: out.put(('navigate',target,None,str(e)))
+            finally:
+                with lock:
+                    # Background code touches only plain connector state, never the Tk root.
+                    async_state['nav_worker_running']=False
+        t=threading.Thread(target=nav_worker,name='LogosNavigation',daemon=True); t.start()
+
+    def _drain_logos_async_queue(self):
+        if self._closing:return
+        try:
+            while True:
+                kind,*payload=self._logos_async_queue.get_nowait()
+                if kind=='poll':
+                    state,error=payload
+                    with self._logos_nav_lock:self._logos_async_state['poll_inflight']=False
+                    if error:
+                        self._update_logos_connector_display(error=error)
+                    elif state is not None:
+                        self.logos_connector_state=state; self._update_logos_connector_display(state)
+                        if state.connected and state.reference:
+                            event=self.navigation_broker.new_event(state.reference,'logos',context=self._navigation_context_token())
+                            if event:self._handle_external_navigation_event(event)
+                    self._schedule_logos_poll()
+                elif kind=='navigate':
+                    target,state,error=payload
+                    # A stale completion may arrive after the reviewer already requested another
+                    # verse. Only surface it if useful; the worker will still send the latest target.
+                    if error:
+                        self._update_logos_connector_display(error='Navigation sync paused · '+error)
+                    elif state is not None:
+                        self.logos_connector_state=state; self._update_logos_connector_display(state)
+        except queue.Empty:
+            pass
+        self.after(80,self._drain_logos_async_queue)
+
+    def _sync_current_reference_to_logos(self):
+        if self._navigation_suppress_broadcast or self._navigation_origin=='logos':return
+        if not self.logos_nav_sync_var.get():return
+        ref=self._current_bridge_reference()
+        if not ref:return
+        origin=self.navigation_broker.record_outbound('logos',ref)
+        self._last_logos_sent_ref=ref; self._last_logos_origin_id=origin
+        self._queue_logos_navigation(ref,origin)
+
+    def _broadcast_current_reference(self):
+        ref=self._current_bridge_reference()
+        if not ref or self._navigation_suppress_broadcast:return
+        self.navigation_broker.set_bridge_reference(ref,origin=self._navigation_origin)
+        self._sync_current_reference_to_paratext(); self._sync_current_reference_to_logos()
+
+    def _navigate_from_external(self, reference: str, source: str):
+        import re
+        ref=normalize_reference(reference); m=re.match(r'^([1-4]?[A-Z]{2,4})\s+(\d+):([0-9]+[a-z]?)$',ref,re.I)
+        if not m:return False
+        book,ch,vs=m.groups(); source=str(source or '').lower()
+        active_pid=(getattr(self.paratext_connector_state,'project_id','') or '').strip() if source=='paratext' and self.paratext_connector_state else ''
+        def eligible(p):
+            if p.book_id.upper()!=book:return False
+            if source!='paratext' or not active_pid:return True
+            try:bound=(self.settings.get_paratext_project_guid(p.path.name) or '').strip()
+            except Exception:bound=''
+            return bool(bound and bound.lower()==active_pid.lower())
+
+        matches=[i for i,p in enumerate(self.projects) if eligible(p)]
+        # Prefer the current project when it already matches. Otherwise never guess between
+        # multiple same-book projects (common when several target-language projects are loaded).
+        current_index=next((i for i,p in enumerate(self.projects) if p is self.project),None)
+        if current_index in matches:
+            target_index=current_index
+        elif len(matches)==1:
+            target_index=matches[0]
+        elif len(matches)>1:
+            self.set_status(f'{source.title()} reference {ref} matches multiple loaded translationCore projects; select the intended project manually.'); return False
+        else:
+            self.set_status(f'{source.title()} reference {ref} has no matching loaded translationCore project; Bridge navigation unchanged.'); return False
+
+        target_project=self.projects[target_index]
+        # Validate the whole destination before changing the current project. An unavailable
+        # chapter/verse must not leave the reviewer unexpectedly switched to another project.
+        try:chapters=list(target_project.chapters())
+        except Exception as e:
+            self.set_status(f'{source.title()} reference {ref} could not be validated: {e}'); return False
+        if ch not in chapters:
+            self.set_status(f'{source.title()} reference {ref} is not present in the matching translationCore project.'); return False
+        try:verses=list(target_project.verses(ch))
+        except Exception as e:
+            self.set_status(f'{source.title()} reference {ref} could not be validated: {e}'); return False
+        target_vs=vs
+        # Logos may expose subverse references such as 1a. Use the exact tC verse when present;
+        # otherwise fall back to the base numbered verse, never to an unrelated verse.
+        if target_vs not in verses and re.fullmatch(r'\d+[a-z]',target_vs,re.I):
+            base=re.match(r'\d+',target_vs).group(0)
+            if base in verses:target_vs=base
+        if target_vs not in verses:
+            self.set_status(f'{source.title()} reference {ref} is not present in the matching translationCore project.'); return False
+        # Read the exact verse data before changing any UI/project selection. Malformed or missing
+        # alignment data must not leave the reviewer half-switched to an unusable destination.
+        try:
+            target_project.load_verse_alignment(ch,target_vs)
+            target_project.target_verse_text(ch,target_vs)
+        except Exception as e:
+            self.set_status(f'{source.title()} reference {ref} could not be loaded safely: {e}'); return False
+
+        if self.session and self.session.dirty and not self._confirm_discard():return False
+        previous_origin=self._navigation_origin; self._navigation_origin=source; self._navigation_suppress_broadcast=True
+        try:
+            if self.project is not target_project:
+                self.project_combo.current(target_index); self._project_changed()
+            if self.chapter_var.get()!=ch:
+                self.chapter_var.set(ch); self._chapter_changed(force=True)
+            self.verse_var.set(target_vs)
+            self._navigation_suppress_broadcast=False
+            self._load_verse()
+            return True
+        finally:
+            self._navigation_suppress_broadcast=False; self._navigation_origin=previous_origin if previous_origin!='' else 'bridge'
 
     def _refresh_term_analytics(self):
         if not self.project or not hasattr(self,'term_analytics_tree'): return
@@ -857,18 +1631,156 @@ class BridgeApp(tk.Tk):
         self.language_context=ctx
         self.plugins_var.set(f"ACTIVE: {ctx.source_name} → {ctx.target_name} · target plugin {ctx.target_id} · script {ctx.target_script} · QA: {', '.join(ctx.qa_categories)} · detection: {ctx.detection_basis}")
         if hasattr(self,'paratext_notes_var'):
-            pp=self.project.paratext_notes_path(); self.paratext_notes_var.set(f"Paratext Notes 1.1 companion: {pp} · {'available' if pp.exists() else 'no reviewer discussion notes yet'}")
+            pp=self.project.paratext_notes_path(); puser=self._paratext_note_user() or '(connect Paratext)'; pguid=self.settings.get_paratext_project_guid(self._paratext_project_key()) or '(not bound)'
+            self.paratext_notes_var.set(f"Reviewer notes: {'available' if pp.exists() else 'none yet'} · Bound project: {pguid} · Author: {puser} · Source: {EXTERNAL_NOTE_SOURCE}")
+        if self.paratext_connector_state is not None:
+            self._update_paratext_connector_display(self.paratext_connector_state)
+        if self.logos_connector_state is not None:
+            self._update_logos_connector_display(self.logos_connector_state)
+        self._refresh_api_usage_totals()
+
+    def _paratext_project_key(self) -> str:
+        """Stable local key for the currently open translationCore project.
+
+        Paratext GUID mappings are deliberately per project. A reviewer can switch Genesis/Ruth/
+        Psalms/etc. without inheriting the GUID configured for another translation project.
+        """
+        if not self.project:
+            return ''
+        return self.project.path.name
 
     def _export_paratext_notes(self):
         if not self.project:return
         src=self.project.paratext_notes_path()
         if not src.exists():
-            messagebox.showinfo('Paratext notes','No Paratext-compatible reviewer discussion notes have been recorded for this project yet.'); return
-        dest=filedialog.asksaveasfilename(title='Export Paratext Notes 1.1 XML',defaultextension='.xml',filetypes=[('Paratext notes XML','*.xml'),('XML','*.xml'),('All files','*.*')],initialfile=f'{self.project.book_id}_AI_Bridge_Notes.xml')
+            messagebox.showinfo('Paratext notes','No Paratext Notes 1.1 reviewer notes have been recorded for this project yet.'); return
+        state=self._probe_paratext_connector(silent=True)
+        user=self._paratext_note_user(state,allow_reviewer_fallback=False)
+        if not user:
+            messagebox.showwarning('Paratext notes','A real Paratext user name is required for an API-ready Notes 1.1 export. Connect Paratext or configure the Paratext member username first.'); return
+        dest=filedialog.asksaveasfilename(title='Export Paratext Notes 1.1 XML',defaultextension='.xml',filetypes=[('Paratext Notes 1.1 XML','*.xml'),('XML','*.xml'),('All files','*.*')],initialfile='Notes_AI_Suggestion.xml')
         if not dest:return
         try:
-            shutil.copy2(src,dest); self.set_status(f'Paratext notes exported: {dest}'); messagebox.showinfo('Paratext notes',f'Paratext Notes 1.1-compatible XML exported to:\n{dest}')
+            normalized_notes_11_copy(src,dest,paratext_user=user,ext_user=EXTERNAL_NOTE_SOURCE)
+            self.set_status(f'Paratext Notes 1.1 exported: {dest}')
+            messagebox.showinfo('Paratext notes',f'API-ready Paratext Notes 1.1 XML exported to:\n{dest}\n\nParatext author: {user}\nExternal source: {EXTERNAL_NOTE_SOURCE}\n\nThe filename Notes_AI_Suggestion.xml is only a Bridge/export name; it is not used as a Paratext member identity.')
         except Exception as e: messagebox.showerror('Paratext notes',str(e))
+
+    def _verify_paratext_project(self):
+        """Verify the active local Paratext project through the working Plugin API connector."""
+        if self._busy:return
+        if not self.project:
+            messagebox.showwarning('Paratext project verification','Load a translationCore project first.'); return
+        state=self._probe_paratext_connector(silent=True)
+        if not state:return
+        if not (state.project_id or '').strip():
+            messagebox.showwarning('Paratext project verification','Open the target Scripture project in Paratext first.'); return
+        if not (state.user or '').strip():
+            messagebox.showwarning('Paratext project verification','The connector could not read the current Paratext user. Restart Paratext/connector and try again.'); return
+        bound,status=self._live_paratext_binding(state)
+        if status=='matched':
+            self.settings.paratext_username=state.user.strip()
+            if hasattr(self,'paratext_username_var'): self.paratext_username_var.set(state.user.strip())
+            messagebox.showinfo('Paratext project verified',f'Paratext user: {state.user}\nProject: {state.project_name or state.project_id}\nProject ID: {state.project_id}\nReference: {state.reference or "—"}\n\nThe current translationCore project is correctly bound to this active Paratext project.')
+            return
+        if status=='unbound':
+            if messagebox.askyesno('Paratext project verification',f'Paratext user: {state.user}\nProject: {state.project_name or state.project_id}\nProject ID: {state.project_id}\n\nThis translationCore project is not bound yet. Bind it to this active Paratext project now?'):
+                self.settings.set_paratext_project_guid(self._paratext_project_key(),state.project_id)
+                self.settings.paratext_username=state.user.strip()
+                if hasattr(self,'paratext_guid_var'): self.paratext_guid_var.set(state.project_id)
+                if hasattr(self,'paratext_username_var'): self.paratext_username_var.set(state.user.strip())
+                self._update_paratext_connector_display(state)
+                self.set_status('Paratext project verified and bound through the local connector.')
+            return
+        if status=='mismatch':
+            replace=messagebox.askyesno('Paratext project verification',f'PROJECT MISMATCH\n\nThis translationCore project is bound to:\n{bound}\n\nActive Paratext project:\n{state.project_name or "—"}\n{state.project_id}\n\nIf the active Paratext project is the intended project, replace the old Bridge binding now?\n\nNo Scripture will be modified.')
+            if replace:
+                self.settings.set_paratext_project_guid(self._paratext_project_key(),state.project_id)
+                self.settings.paratext_username=state.user.strip()
+                if hasattr(self,'paratext_guid_var'): self.paratext_guid_var.set(state.project_id)
+                if hasattr(self,'paratext_username_var'): self.paratext_username_var.set(state.user.strip())
+                self._update_paratext_connector_display(state)
+                self.set_status('Paratext project binding replaced after explicit verification.')
+            return
+        messagebox.showwarning('Paratext project verification','Could not verify the current project binding.')
+
+    def _sync_paratext_notes(self):
+        """Create pending Bridge reviewer notes through the local Paratext Plugin API.
+
+        The live plugin owns the actual Project Note author, so Paratext records the current
+        logged-in Paratext user. AI provenance is carried separately as ``AI Suggestion`` in the
+        note body. No Registry username/registration-code grant is needed for this local path.
+        """
+        if self._busy:return
+        if not self.project:return
+        src=self.project.paratext_notes_path()
+        if not src.exists():
+            messagebox.showinfo('Paratext sync','No reviewer notes are available to synchronize.'); return
+        state=self._probe_paratext_connector(silent=True)
+        if not state:return
+        try:self._require_live_paratext_binding(state)
+        except Exception as e:
+            messagebox.showwarning('Paratext sync',str(e)); return
+        if not (state.user or '').strip():
+            messagebox.showwarning('Paratext sync','The connector could not identify the current Paratext user. Notes were not sent.'); return
+        try:items=iter_notes_11(src)
+        except Exception as e:
+            messagebox.showerror('Paratext sync',str(e)); return
+        if not items:
+            messagebox.showinfo('Paratext sync','No reviewer notes are available to synchronize.'); return
+        sync_state=self.project.load_paratext_note_sync_state()
+        pending=[]; already=0; unsupported=[]
+        for item in items:
+            if item.get('unsupported_reason'):
+                unsupported.append(item); continue
+            previous=(sync_state.get('items') or {}).get(item['thread_id']) or {}
+            if previous and str(previous.get('project_id') or '').lower()==str(state.project_id or '').lower():
+                if previous.get('fingerprint')==item.get('fingerprint'):
+                    already+=1; continue
+                unsupported.append({**item,'unsupported_reason':'This Bridge note changed after it was already synchronized. It was not duplicated automatically.'}); continue
+            pending.append(item)
+        summary_intro=(f'Active Paratext project: {state.project_name or state.project_id}\nCurrent Paratext user/author: {state.user}\nExternal source label: {EXTERNAL_NOTE_SOURCE}\n\nPending: {len(pending)}\nAlready synchronized: {already}\nNeeds attention: {len(unsupported)}')
+        if not pending:
+            messagebox.showinfo('Sync Notes to Paratext',summary_intro+'\n\nNothing new needs to be created in Paratext.'); return
+        if not messagebox.askyesno('Sync Notes to Paratext',summary_intro+'\n\nCreate the pending Project Notes now?\n\nParatext will record the real current Paratext user as the note author. Scripture will not be modified.'):
+            return
+        project=self.project
+        project_id=state.project_id
+        project_name=state.project_name
+        paratext_user=state.user
+        def work():
+            state_data=project.load_paratext_note_sync_state(); state_items=state_data.setdefault('items',{})
+            created=[]; failed=[]
+            for item in pending:
+                try:
+                    result=self.paratext_connector.create_note(
+                        item['reference'],item['selected_text'],item['content'],'',
+                        project_id=project_id,before_context=item['before_context'],after_context=item['after_context'])
+                    state_items[item['thread_id']]={
+                        'project_id':project_id,
+                        'project_name':project_name,
+                        'paratext_user':paratext_user,
+                        'reference':item['reference'],
+                        'fingerprint':item['fingerprint'],
+                        'synced_at':datetime.now().astimezone().isoformat(),
+                        'external_source':EXTERNAL_NOTE_SOURCE,
+                    }
+                    project.save_paratext_note_sync_state(state_data)
+                    created.append({'item':item,'message':str(result.get('message') or '')})
+                except Exception as e:
+                    failed.append({'item':item,'error':str(e)})
+            return {'created':created,'failed':failed,'already':already,'unsupported':unsupported,'project_id':project_id,'project_name':project_name,'user':paratext_user}
+        def success(result):
+            self._end_job('Paratext Notes synchronization complete')
+            created=len(result['created']); failed=len(result['failed']); attention=len(result['unsupported'])
+            self.log(f'Live Paratext note sync: created={created}, already={result["already"]}, failed={failed}, attention={attention}, project={project_id}, user={paratext_user}')
+            detail=[]
+            for f in result['failed'][:8]: detail.append(f"{f['item']['reference']}: {f['error']}")
+            for u in result['unsupported'][:8]: detail.append(f"{u['reference']}: {u['unsupported_reason']}")
+            suffix=('\n\nNeeds attention:\n'+'\n'.join(detail)) if detail else ''
+            messagebox.showinfo('Paratext sync',f'Paratext Project Notes sync finished.\n\nAuthor: {paratext_user}\nExternal source: {EXTERNAL_NOTE_SOURCE}\nCreated: {created}\nAlready synchronized: {result["already"]}\nFailed: {failed}\nNeeds attention: {attention}'+suffix)
+            self._refresh_production()
+        self._background('Synchronizing reviewer notes through Paratext Live Connector',work,success,determinate=False,ai_operation=False)
 
     def _recover_transactions(self):
         if not self.project:return
@@ -939,8 +1851,18 @@ class BridgeApp(tk.Tk):
         self._background('Benchmarking full project',work,done,determinate=False,ai_operation=False)
 
     def _build_settings_tab(self):
-        outer=ttk.Frame(self.settings_tab,padding=8); outer.pack(fill='both',expand=True)
-        api=ttk.LabelFrame(outer,text='OpenAI API · security · model routing',padding=8); api.pack(fill='x')
+        shell=ttk.Frame(self.settings_tab,padding=6); shell.pack(fill='both',expand=True); shell.rowconfigure(0,weight=1); shell.columnconfigure(0,weight=1)
+        self.settings_scroll_canvas=tk.Canvas(shell,highlightthickness=0,borderwidth=0)
+        try:self.settings_scroll_canvas.configure(background=self.cget('background'))
+        except Exception:pass
+        sy=ttk.Scrollbar(shell,orient='vertical',command=self.settings_scroll_canvas.yview); self.settings_scroll_canvas.configure(yscrollcommand=sy.set)
+        self.settings_scroll_canvas.grid(row=0,column=0,sticky='nsew'); sy.grid(row=0,column=1,sticky='ns')
+        outer=ttk.Frame(self.settings_scroll_canvas,padding=2); self.settings_body=outer
+        self._settings_canvas_window=self.settings_scroll_canvas.create_window((0,0),window=outer,anchor='nw')
+        outer.bind('<Configure>',lambda e:self.settings_scroll_canvas.configure(scrollregion=self.settings_scroll_canvas.bbox('all')))
+        self.settings_scroll_canvas.bind('<Configure>',lambda e:self.settings_scroll_canvas.itemconfigure(self._settings_canvas_window,width=max(1,e.width)))
+
+        sec=_CollapsibleSection(outer,'OpenAI API · security · model routing',self.settings,'settings.api',expanded=True); sec.pack(fill='x'); api=sec.body
         ttk.Label(api,text='API key').grid(row=0,column=0,sticky='w')
         self.api_key_var=tk.StringVar(value=self.settings.get_api_key()); ttk.Entry(api,textvariable=self.api_key_var,show='•').grid(row=0,column=1,sticky='ew',padx=6)
         self.persist_key_var=tk.BooleanVar(value=True); ttk.Checkbutton(api,text='Protect with Windows DPAPI and remember on this PC',variable=self.persist_key_var).grid(row=1,column=1,sticky='w')
@@ -952,15 +1874,50 @@ class BridgeApp(tk.Tk):
         self.reviewer_name_var=tk.StringVar(value=self.settings.reviewer_name); ttk.Entry(api,textvariable=self.reviewer_name_var,width=32).grid(row=4,column=1,sticky='w',padx=6,pady=(6,0))
         ttk.Label(api,text='Session cost warning (USD)').grid(row=5,column=0,sticky='w',pady=(6,0))
         self.cost_warning_var=tk.StringVar(value=str(self.settings.get_setting('cost_warning_usd','5.00'))); ttk.Entry(api,textvariable=self.cost_warning_var,width=12).grid(row=5,column=1,sticky='w',padx=6,pady=(6,0))
-        buttons=ttk.Frame(api); buttons.grid(row=0,column=2,rowspan=6,padx=8,sticky='n')
-        ttk.Button(buttons,text='Save Settings',command=self._save_settings).pack(fill='x'); ttk.Button(buttons,text='Test API Connection',command=self._test_api_connection).pack(fill='x',pady=(6,0)); ttk.Button(buttons,text='What Was Sent to AI?',command=self._show_privacy_manifest).pack(fill='x',pady=(6,0))
-        api.columnconfigure(1,weight=1)
-        safety=ttk.LabelFrame(outer,text='Production safety boundary',padding=8); safety.pack(fill='x',pady=8)
-        self.safety_label=ttk.Label(safety,text='AI never silently modifies Scripture or marks checks human-complete. Human-approved Scripture/alignment/TN/TW writes use backups, atomic JSON, durable transaction journals, rollback and audit history. Translation Helps and source-language resources remain read-only. API credentials are never written into project files.',wraplength=1180); self.safety_label.pack(anchor='w')
-        logs=ttk.LabelFrame(outer,text='Session log / API diagnostics',padding=4); logs.pack(fill='both',expand=True)
+        ttk.Separator(api,orient='horizontal').grid(row=6,column=0,columnspan=2,sticky='ew',pady=(8,5))
+        ttk.Label(api,text='Bridge-recorded lifetime usage').grid(row=7,column=0,sticky='w')
+        usage_row=ttk.Frame(api); usage_row.grid(row=7,column=1,sticky='w',padx=6)
+        self.api_total_tokens_var=tk.StringVar(value='0 tokens'); self.api_total_cost_var=tk.StringVar(value='$0.0000 estimated')
+        ttk.Label(usage_row,textvariable=self.api_total_tokens_var,style='Metric.TLabel').pack(side='left')
+        ttk.Label(usage_row,text=' · ').pack(side='left'); ttk.Label(usage_row,textvariable=self.api_total_cost_var,style='Metric.TLabel').pack(side='left')
+        ttk.Label(api,text='Totals include AI calls recorded by this Bridge settings profile; they are not an OpenAI account billing statement.',wraplength=820).grid(row=8,column=0,columnspan=2,sticky='w',pady=(3,0))
+        buttons=ttk.Frame(api); buttons.grid(row=0,column=2,rowspan=9,padx=8,sticky='n')
+        save_btn=ttk.Button(buttons,text='Save Settings',command=self._save_settings); save_btn.pack(fill='x')
+        test_btn=ttk.Button(buttons,text='Test API Connection',command=self._test_api_connection); test_btn.pack(fill='x',pady=(6,0))
+        privacy_btn=ttk.Button(buttons,text='What Was Sent to AI?',command=self._show_privacy_manifest); privacy_btn.pack(fill='x',pady=(6,0))
+        api.columnconfigure(1,weight=1); self._refresh_api_usage_totals()
+
+        sec=_CollapsibleSection(outer,'Paratext Project Notes · local connector',self.settings,'settings.paratext',expanded=False); sec.pack(fill='x',pady=(6,0)); ptx=sec.body
+        ttk.Label(ptx,text='Project GUID').grid(row=0,column=0,sticky='w')
+        self.paratext_guid_var=tk.StringVar(value=self.settings.get_paratext_project_guid(self._paratext_project_key())); ttk.Entry(ptx,textvariable=self.paratext_guid_var,width=48).grid(row=0,column=1,sticky='ew',padx=6)
+        ttk.Label(ptx,text='Paratext member username').grid(row=1,column=0,sticky='w',pady=(6,0))
+        self.paratext_username_var=tk.StringVar(value=self.settings.paratext_username); ttk.Entry(ptx,textvariable=self.paratext_username_var,width=36).grid(row=1,column=1,sticky='w',padx=6,pady=(6,0))
+        ttk.Label(ptx,text='Legacy server registration code (optional)').grid(row=2,column=0,sticky='w',pady=(6,0))
+        self.paratext_registration_var=tk.StringVar(value=self.settings.get_paratext_registration_code()); ttk.Entry(ptx,textvariable=self.paratext_registration_var,show='•',width=36).grid(row=2,column=1,sticky='w',padx=6,pady=(6,0))
+        self.paratext_persist_var=tk.BooleanVar(value=True); ttk.Checkbutton(ptx,text='Protect registration code with Windows DPAPI and remember on this PC',variable=self.paratext_persist_var).grid(row=3,column=1,sticky='w',padx=6,pady=(4,0))
+        ttk.Label(ptx,text='Daily Paratext verification, any-direction verse navigation, and note synchronization are on Production. Local sync uses the actual Paratext user; AI Suggestion remains provenance.',wraplength=1000).grid(row=4,column=0,columnspan=2,sticky='w',pady=(7,0))
+        pb=ttk.Frame(ptx); pb.grid(row=0,column=2,rowspan=4,sticky='n',padx=(8,0)); install_btn=ttk.Button(pb,text='Install / Update Connector…',command=self._install_paratext_connector); install_btn.pack(fill='x')
+        ptx.columnconfigure(1,weight=1)
+
+        sec=_CollapsibleSection(outer,'Logos Desktop · local COM navigation',self.settings,'settings.logos',expanded=False); sec.pack(fill='x',pady=(6,0)); logos=sec.body
+        ttk.Label(logos,text='The Bridge uses the Windows Logos COM API locally. No Logos username, password, API key, or network listener is required. Start Logos Desktop before enabling verse synchronization.',wraplength=1000).pack(anchor='w',fill='x')
+        self.logos_settings_status_var=tk.StringVar(value='Status is shown on Production → Logos · Live Verse Navigation.')
+        ttk.Label(logos,textvariable=self.logos_settings_status_var,wraplength=1000).pack(anchor='w',fill='x',pady=(5,0))
+
+        sec=_CollapsibleSection(outer,'Production safety boundary',self.settings,'settings.safety',expanded=False); sec.pack(fill='x',pady=(6,0)); safety=sec.body
+        self.safety_label=ttk.Label(safety,text='AI never silently modifies Scripture or marks checks human-complete. Human-approved Scripture/alignment/TN/TW writes use backups, atomic JSON, durable transaction journals, rollback and audit history. Translation Helps and source-language resources remain read-only. API credentials are never written into project files.',wraplength=1180); self.safety_label.pack(anchor='w',fill='x')
+
+        sec=_CollapsibleSection(outer,'Session log / API diagnostics',self.settings,'settings.logs',expanded=True); sec.pack(fill='both',expand=True,pady=(6,0)); logs=sec.body
         logs.rowconfigure(0,weight=1); logs.columnconfigure(0,weight=1)
         self.log_text=tk.Text(logs,height=16,wrap='none'); lgy=ttk.Scrollbar(logs,orient='vertical',command=self.log_text.yview); lgx=ttk.Scrollbar(logs,orient='horizontal',command=self.log_text.xview); self.log_text.configure(yscrollcommand=lgy.set,xscrollcommand=lgx.set)
         self.log_text.grid(row=0,column=0,sticky='nsew'); lgy.grid(row=0,column=1,sticky='ns'); lgx.grid(row=1,column=0,sticky='ew'); self.log_text.configure(state='disabled')
+
+        for btn,tip in [(save_btn,'Save API/model/reviewer settings; credentials are persisted only through the configured secure storage.'),(test_btn,'Verify the OpenAI API configuration without writing translation data.'),(privacy_btn,'Inspect the data categories sent with the most recent AI request.'),(install_btn,'Install or update the local Paratext connector; close Paratext first.')]: self._tip(btn,tip)
+
+    def _refresh_api_usage_totals(self):
+        totals=self.settings.get_ai_usage_totals()
+        if hasattr(self,'api_total_tokens_var'): self.api_total_tokens_var.set(f"{int(totals.get('tokens',0) or 0):,} tokens")
+        if hasattr(self,'api_total_cost_var'): self.api_total_cost_var.set(f"${float(totals.get('estimatedCostUSD',0.0) or 0.0):.4f} estimated")
 
     def log(self, msg: str):
         safe = sanitize_for_log(msg)
@@ -969,16 +1926,45 @@ class BridgeApp(tk.Tk):
     def set_status(self,msg):
         self.status_var.set(msg); self.update_idletasks()
 
-    def _set_api_indicator(self, state, text=None):
-        self._api_state = state
-        if not hasattr(self, 'api_dot'): return
-        colors = {'connected':('#b7f7c6','#19a84a'), 'error':('#ffd0d0','#d93025'), 'testing':('#fff0b3','#e5a000'), 'unknown':('#e5e7eb','#8a8f98')}
-        outer, inner = colors.get(state, colors['unknown'])
+    def _draw_api_dot(self, outer: str, inner: str):
+        if not hasattr(self,'api_dot'): return
         self.api_dot.delete('all')
         self.api_dot.create_oval(2,2,20,20,fill=outer,outline='')
         self.api_dot.create_oval(6,6,16,16,fill=inner,outline='')
+
+    def _set_api_indicator(self, state, text=None):
+        self._api_state = state
+        colors = {'connected':('#b7f7c6','#19a84a'), 'error':('#ffd0d0','#d93025'), 'testing':('#fff0b3','#e5a000'), 'unknown':('#e5e7eb','#8a8f98')}
+        outer, inner = colors.get(state, colors['unknown'])
+        self._draw_api_dot(outer,inner)
         if text is not None and hasattr(self,'api_status_var'):
             self.api_status_var.set(text)
+
+    def _start_ai_blink(self):
+        """Blink the API lamp green only while an AI worker is actively running."""
+        self._stop_ai_blink(redraw=False)
+        self._ai_blink_phase=False
+        def tick():
+            if self._closing or not self._busy or not self._bg_is_ai:
+                self._ai_blink_after_id=None
+                return
+            self._ai_blink_phase=not self._ai_blink_phase
+            if self._ai_blink_phase:
+                self._draw_api_dot('#c9fbd5','#12b84f')
+            else:
+                self._draw_api_dot('#e7f9eb','#79d997')
+            self._ai_blink_after_id=self.after(420,tick)
+        tick()
+
+    def _stop_ai_blink(self, redraw=True):
+        aid=self._ai_blink_after_id
+        self._ai_blink_after_id=None
+        if aid is not None:
+            try:self.after_cancel(aid)
+            except tk.TclError:pass
+        if redraw:
+            colors={'connected':('#b7f7c6','#19a84a'),'error':('#ffd0d0','#d93025'),'testing':('#fff0b3','#e5a000'),'unknown':('#e5e7eb','#8a8f98')}
+            self._draw_api_dot(*colors.get(self._api_state,colors['unknown']))
 
     def _begin_job(self, label, determinate=False):
         self._active_job_label = label
@@ -1046,6 +2032,15 @@ class BridgeApp(tk.Tk):
         except Exception as e:
             messagebox.showerror('User Guide',str(e))
 
+    def _show_keyboard_shortcuts(self):
+        messagebox.showinfo('Keyboard Shortcuts',
+            'F5  · Run tN tW / full verse review\n'
+            'F8  · Review next priority\n'
+            'Ctrl+Enter  · Accept selected review item\n'
+            'Ctrl+Shift+D  · Needs Discussion\n'
+            'Ctrl+Shift+R  · Reject AI\n'
+            'Ctrl+Shift+Right  · Next verse')
+
     def _cancel_batch(self):
         if self._busy:
             self._cancel_event.set(); self.set_status('Cancellation requested — current API call will finish, then batch will stop')
@@ -1101,8 +2096,27 @@ class BridgeApp(tk.Tk):
             rows.append({'chapter':r['chapter'],'verse':r['verse'],'cache':r.get('cache',''),'counts':counts,'checks':int(r.get('invalidChecks',0))+int(r.get('discussions',0)),'summary':summary})
         self._exception_rows=rows; self.exception_tree.delete(*self.exception_tree.get_children())
         for i,r in enumerate(rows):
-            c=r['counts']; self.exception_tree.insert('', 'end', iid=str(i), values=(f"{r['chapter']}:{r['verse']}",str(r['cache']).upper(),c.get('critical',0),c.get('high',0),c.get('medium',0),r['checks'],r['summary'][:260]))
+            c=r['counts']; self.exception_tree.insert('', 'end', iid=str(i), values=(f"{r['chapter']}:{r['verse']}",str(r['cache']).upper(),c.get('critical',0),c.get('high',0),c.get('medium',0),r['checks']))
         self._resize_tree_columns()
+        if rows:
+            first=self.exception_tree.get_children()[0]; self.exception_tree.selection_set(first); self.exception_tree.focus(first); self._dashboard_exception_selected()
+        elif hasattr(self,'exception_detail'):
+            self._set_text(self.exception_detail,'No Critical / High / Review / Stale exceptions are currently queued.')
+
+    def _dashboard_exception_selected(self,event=None):
+        if not hasattr(self,'exception_detail'): return
+        sel=self.exception_tree.selection() if hasattr(self,'exception_tree') else ()
+        if not sel:
+            self._set_text(self.exception_detail,'Select an exception to read its complete summary.')
+            return
+        try:
+            r=self._exception_rows[int(sel[0])]
+        except (ValueError,IndexError):
+            self._set_text(self.exception_detail,'')
+            return
+        c=r.get('counts',{})
+        header=f"{self.project.book_id.upper() if self.project else ''} {r['chapter']}:{r['verse']} · cache {str(r.get('cache','')).upper()} · Critical {c.get('critical',0)} · High {c.get('high',0)} · Medium {c.get('medium',0)} · checks {r.get('checks',0)}"
+        self._set_text(self.exception_detail,header+'\n\n'+str(r.get('summary','')).strip())
 
     def _dashboard_open_selected(self,event=None):
         sel=self.exception_tree.selection()
@@ -1146,6 +2160,8 @@ class BridgeApp(tk.Tk):
         i=self.project_combo.current()
         if i<0: return
         self.project=self.projects[i]
+        if hasattr(self,'paratext_guid_var'):
+            self.paratext_guid_var.set(self.settings.get_paratext_project_guid(self._paratext_project_key()))
         pending=self.project.pending_transactions()
         if pending:
             recover=False
@@ -1159,12 +2175,17 @@ class BridgeApp(tk.Tk):
             self.kb=TranslationHelpsKnowledgeBase(self.project)
         except Exception as e:
             self.kb=None; self.log(f'Knowledge Base unavailable: {e}')
-        s=self.project.summary; self.project_info_var.set(f'tC {s.tc_version} / {s.edit_version}')
+        s=self.project.summary
+        ident=detect_project_identity(self.project.path)
+        d43=ident.get('door43_username') or ident.get('git_name') or ''
+        self.project_info_var.set(f"tC {s.tc_version} / {s.edit_version}" + (f" · Door43 {d43}" if d43 else ''))
+        self._door43_identity=ident
         ch=self.project.chapters(); self.chapter_combo['values']=ch
         if ch: self.chapter_combo.set(ch[0]); self._chapter_changed(force=True)
         self.dashboard_summary_var.set(f'{s.display_name}: project scan pending…')
         self._set_text(self.dashboard_scan,'Project selected. Refreshing scan will classify alignment, tC checks, cached AI reviews, stale work and human decisions.')
         self.exception_tree.delete(*self.exception_tree.get_children()); self._exception_rows=[]
+        if hasattr(self,'exception_detail'): self._set_text(self.exception_detail,'Select an exception to read its complete summary.')
         self.log(f'Project: {s.display_name}; checkData={self.project.check_types()}; index={self.project.index_tools()}')
         self._refresh_production(); self._refresh_term_analytics()
 
@@ -1189,12 +2210,13 @@ class BridgeApp(tk.Tk):
         try:
             raw=self.project.load_alignment_chapter(ch)[vs]
             alignment=self.project.load_verse_alignment(ch,vs)
-            self.original_verse_raw=copy.deepcopy(raw); self.session=EditSession(alignment); self.pending_ai_proposal=None; self.apply_ai_btn.configure(state='disabled'); self.ai_issues=[]; self.ai_check_reviews=[]; self.review_alignment_for_checks=None; self.review_meta={}
+            self.original_verse_raw=copy.deepcopy(raw); self.session=EditSession(alignment); self.pending_ai_proposal=None; self._active_alignment_request=None; self.apply_ai_btn.configure(state='disabled'); self.ai_issues=[]; self.ai_check_reviews=[]; self.review_alignment_for_checks=None; self.review_meta={}
             self.language_context=self.plugin_registry.detect_project(self.project, alignment, self.project.target_verse_text(ch,vs)); self._apply_language_context()
             self._set_text(self.verse_text,self.project.target_verse_text(ch,vs))
             self._set_text(self.ai_preview,'')
             self._refresh_alignment(); self._refresh_tc_checks(); self._refresh_kb(); self._refresh_terminology(); self._load_saved_review(); self._run_local_qa()
             self.set_status(f'Loaded {self.project.book_id.upper()} {ch}:{vs}')
+            self._broadcast_current_reference()
         except Exception as e: messagebox.showerror('Verse load failed',str(e)); self.log(traceback.format_exc())
 
     @staticmethod
@@ -1255,6 +2277,8 @@ class BridgeApp(tk.Tk):
         total=int(total_override if total_override is not None else (getattr(usage,'total_tokens',0) or 0)) if usage or total_override is not None else 0
         self.usage_var.set(f'{label} {total:,}')
         cost=float(cost_override if cost_override is not None else (getattr(client,'last_cost_usd',0.0) or 0.0)); self.cost_var.set(f'Cost ${cost:.4f}')
+        try:self.settings.record_ai_usage(total,cost); self._refresh_api_usage_totals()
+        except Exception:pass
         if self.project:
             try:
                 MetricsStore(self.project.companion_dir(),self.project.book_id).event('ai_call',model=getattr(client,'model',''),reasoning=getattr(client,'reasoning_effort',''),input_tokens=int(getattr(usage,'input_tokens',0) or 0) if usage else 0,output_tokens=int(getattr(usage,'output_tokens',0) or 0) if usage else 0,total_tokens=total,estimated_cost_usd=cost)
@@ -1270,6 +2294,7 @@ class BridgeApp(tk.Tk):
             self.set_status(f'Busy: {self._active_job_label or "another operation"}')
             return False
         self._busy=True; self._bg_success_handler=on_success; self._bg_is_ai=bool(ai_operation); self._begin_job(label,determinate=determinate)
+        if self._bg_is_ai: self._start_ai_blink()
         # Polling is scheduled from the UI thread; workers never call tkinter directly.
         self.after(20,self._poll_ui_queue)
         # Do not let the worker closure retain the Tk root merely to reach its queue.
@@ -1309,7 +2334,9 @@ class BridgeApp(tk.Tk):
             self.after(30,self._poll_ui_queue)
 
     def _finish_bg(self,error,result,on_success):
-        self._busy=False; self.job_progress.stop(); is_ai=self._bg_is_ai; self._bg_is_ai=False
+        is_ai=self._bg_is_ai
+        if is_ai: self._stop_ai_blink(redraw=True)
+        self._busy=False; self.job_progress.stop(); self._bg_is_ai=False
         # The worker has already queued its terminal message; wait briefly for its stack to
         # unwind on the main thread side so Tk-owned application objects are never finalized
         # by a just-ending worker thread.
@@ -1342,13 +2369,65 @@ class BridgeApp(tk.Tk):
         try: client=self._get_client('alignment')
         except Exception as e: messagebox.showerror('API configuration',str(e)); return
         ch=self.chapter_var.get();vs=self.verse_var.get(); current=copy.deepcopy(self.session.current)
-        def success(proposal):
+        try:self.project.ensure_v073_migration_snapshot()
+        except Exception as e:self.log(f'Could not create v0.7.4 hash snapshot: {e}')
+        # A new request invalidates every older pending proposal immediately.
+        self.pending_ai_proposal=None; self.apply_ai_btn.configure(state='disabled'); self._set_text(self.ai_preview,'')
+        context=make_request_context(self.project,ch,vs,current); self._active_alignment_request=context
+        def work():
+            return context, client.propose_alignment(self.project,ch,vs,current,mode='gap_fill')
+        def success(result):
+            req,proposal=result
+            if not self.project or not self.session or not request_context_matches(req,self.project,self.chapter_var.get(),self.verse_var.get(),self.session.current):
+                self.log(f'Discarded stale AI alignment result {req.request_id} for {req.book_id.upper()} {req.chapter}:{req.verse}')
+                self._end_job('AI result discarded — verse/project state changed while AI was working')
+                return
             try: groups=validate_proposal(current,proposal)
-            except Exception as e: messagebox.showerror('Unsafe AI proposal rejected',str(e)); self.log(f'Proposal rejected: {e}'); return
-            self.pending_ai_proposal=proposal; self.apply_ai_btn.configure(state='normal')
-            self._render_ai_proposal(current,proposal); self._update_ai_usage(client); self.set_status('AI proposal validated; not yet applied')
-            self.log(f'AI alignment proposal validated for {self.project.book_id} {ch}:{vs}: {len(groups)} groups')
-        self._background('Requesting AI alignment',lambda:client.propose_alignment(self.project,ch,vs,current),success,ai_operation=True)
+            except Exception as e:
+                messagebox.showerror('Unsafe AI proposal rejected',str(e)); self.log(f'Proposal rejected: {e}'); return
+            self.pending_ai_proposal=proposal; self.last_alignment_diagnostics=proposal; self.apply_ai_btn.configure(state='normal')
+            try:self.project.record_alignment_diagnostic(ch,vs,{'requestContext':req.to_dict(),'proposal':proposal,'result':'validated'})
+            except Exception as e:self.log(f'Alignment diagnostic write failed: {e}')
+            self._render_ai_proposal(current,proposal,'Gap-fill proposal compiled deterministically. Existing non-empty project groups are protected.')
+            self._update_ai_usage(client)
+            conflicts=len(proposal.get('conflicts',[])); uncertain=len(proposal.get('uncertain_links',[]))
+            extra=(f' · {conflicts} protected conflict(s) not applied' if conflicts else '')+(f' · {uncertain} uncertain link(s) held for review' if uncertain else '')
+            self.set_status('AI links compiled into a safe proposal; not yet applied'+extra)
+            self.log(f'AI gap-fill proposal compiled for {self.project.book_id} {ch}:{vs}: {len(groups)} groups{extra}')
+        self._background('Requesting AI alignment links',work,success,ai_operation=True)
+
+    def _audit_existing_alignment(self):
+        if not self.project or not self.session:return
+        try: client=self._get_client('alignment')
+        except Exception as e: messagebox.showerror('API configuration',str(e)); return
+        ch=self.chapter_var.get();vs=self.verse_var.get(); current=copy.deepcopy(self.session.current)
+        context=make_request_context(self.project,ch,vs,current)
+        def work(): return context, client.propose_alignment(self.project,ch,vs,current,mode='audit')
+        def success(result):
+            req,proposal=result
+            if not self.project or not self.session or not request_context_matches(req,self.project,self.chapter_var.get(),self.verse_var.get(),self.session.current):
+                self.log(f'Discarded stale alignment audit {req.request_id} for {req.book_id.upper()} {req.chapter}:{req.verse}')
+                return
+            diff=proposal_difference(current,proposal); self.last_alignment_diagnostics={**proposal,'audit_difference':diff}
+            self.pending_ai_proposal=None; self.apply_ai_btn.configure(state='disabled')
+            prefix=(f"READ-ONLY ALIGNMENT AUDIT — existing data was not changed. "
+                    f"Unchanged groups: {diff['unchanged']} · Proposed-only: {len(diff['proposal_only'])} · Existing-only: {len(diff['existing_only'])}.")
+            self._render_ai_proposal(current,proposal,prefix)
+            try:self.project.record_alignment_diagnostic(ch,vs,{'requestContext':req.to_dict(),'proposal':proposal,'auditDifference':diff,'result':'read_only_audit'})
+            except Exception as e:self.log(f'Alignment audit diagnostic write failed: {e}')
+            self._update_ai_usage(client); self.set_status('Existing alignment audit complete — read only; no project data changed')
+        self._background('Auditing existing alignment',work,success,ai_operation=True)
+
+    def _show_alignment_diagnostics(self):
+        data=self.last_alignment_diagnostics or {}
+        if not data:
+            messagebox.showinfo('Alignment Diagnostics','No v0.7.4 compiler diagnostic is available yet. Run Fill Alignment Gaps or Audit Existing Alignment first.'); return
+        win=tk.Toplevel(self); win.title('Alignment Reliability Diagnostics'); win.geometry('900x650'); win.transient(self)
+        holder=ttk.Frame(win,padding=8); holder.pack(fill='both',expand=True); holder.rowconfigure(0,weight=1); holder.columnconfigure(0,weight=1)
+        text=tk.Text(holder,wrap='word',font=('Consolas',9)); sy=ttk.Scrollbar(holder,orient='vertical',command=text.yview); text.configure(yscrollcommand=sy.set)
+        text.grid(row=0,column=0,sticky='nsew'); sy.grid(row=0,column=1,sticky='ns')
+        text.insert('1.0',json.dumps(data,ensure_ascii=False,indent=2)); text.configure(state='disabled')
+        ttk.Button(holder,text='Close',command=win.destroy).grid(row=1,column=0,sticky='e',pady=(6,0))
 
     def _apply_ai(self):
         if not self.session or not self.pending_ai_proposal:return
@@ -1459,7 +2538,9 @@ class BridgeApp(tk.Tk):
                     self.project.sync_comment(ch,vs,matches[0].get('contextId',{}),note,self.settings.reviewer_name,gateway_language_quote=str(matches[0].get('contextId',{}).get('occurrenceNote','')))
             paratext_note=None
             if note:
-                paratext_note=self.project.record_paratext_note(ch,vs,note,self.settings.reviewer_name,note_type='AI Bridge QA Discussion',metadata={'decision':decision,'severity':x.severity,'checkId':x.check_id})
+                paratext_note=self.project.record_paratext_note(ch,vs,note,self._paratext_note_user(),note_type='AI Bridge QA Discussion',ext_user=EXTERNAL_NOTE_SOURCE,metadata={'decision':decision,'severity':x.severity,'checkId':x.check_id})
+                if decision in ('needs_discussion','rejected') and self.paratext_live_review_notes_var.get():
+                    self._send_live_paratext_note(note,'',reference=f"{self.project.book_id.upper()} {ch}:{vs}")
             try:
                 metric_name='human_accept' if decision=='accepted' else 'human_reject' if decision=='rejected' else 'human_discussion'
                 MetricsStore(self.project.companion_dir(),self.project.book_id).event(metric_name,chapter=str(ch),verse=str(vs),source=x.source,code=x.code)
@@ -1468,6 +2549,42 @@ class BridgeApp(tk.Tk):
             self._refresh_qa_tree(); self._qa_selected(); self._refresh_exception_queue(); self.set_status(f'QA finding: {decision}')
             if self.fast_review_var.get(): self.after(180,self._review_next_priority)
         except Exception as e: messagebox.showerror('QA decision',str(e))
+
+    def _snap_text_insert_to_grapheme(self, widget: tk.Text):
+        """Keep the Tk insertion cursor out of Tamil/Indic shaping clusters."""
+        try:
+            if widget.tag_ranges('sel'): return
+            line_s,col_s=widget.index('insert').split('.')
+            line=int(line_s); col=int(col_s)
+            text=widget.get(f'{line}.0',f'{line}.end')
+            safe=nearest_grapheme_boundary(text,col)
+            if safe!=col: widget.mark_set('insert',f'{line}.{safe}')
+        except (tk.TclError,ValueError):
+            return
+
+    def _move_text_insert_by_grapheme(self, widget: tk.Text, direction: int, event=None):
+        # Let Ctrl/Alt/Shift combinations keep their native selection/word-navigation behavior.
+        if event is not None and int(getattr(event,'state',0) or 0) & 0x000D:
+            return None
+        try:
+            if widget.tag_ranges('sel'): return None
+            line_s,col_s=widget.index('insert').split('.')
+            line=int(line_s); col=int(col_s); text=widget.get(f'{line}.0',f'{line}.end')
+            if direction<0 and col>0:
+                widget.mark_set('insert',f'{line}.{previous_grapheme_boundary(text,col)}'); widget.see('insert'); return 'break'
+            if direction>0 and col<len(text):
+                widget.mark_set('insert',f'{line}.{next_grapheme_boundary(text,col)}'); widget.see('insert'); return 'break'
+        except (tk.TclError,ValueError):
+            pass
+        return None
+
+    def _configure_grapheme_safe_editor(self, widget: tk.Text):
+        """Apply Windows-friendly Indic text editing behavior without a third-party font."""
+        try: widget.configure(insertwidth=1,insertborderwidth=0,spacing1=2,spacing3=2,padx=5,pady=4)
+        except tk.TclError: pass
+        widget.bind('<ButtonRelease-1>',lambda e,w=widget:w.after_idle(lambda:self._snap_text_insert_to_grapheme(w)),add='+')
+        widget.bind('<Left>',lambda e,w=widget:self._move_text_insert_by_grapheme(w,-1,e),add='+')
+        widget.bind('<Right>',lambda e,w=widget:self._move_text_insert_by_grapheme(w,1,e),add='+')
 
     def _scripture_editor(self, proposed_text: str = '', context_id: dict | None = None):
         if not self.project:return
@@ -1479,8 +2596,9 @@ class BridgeApp(tk.Tk):
         a=ttk.LabelFrame(panes,text=f'Current {target_name}',padding=5); b=ttk.LabelFrame(panes,text=f'Proposed / edited {target_name}',padding=5); c=ttk.LabelFrame(panes,text='Before / after diff',padding=5)
         panes.add(a,weight=2); panes.add(b,weight=3); panes.add(c,weight=2)
         for pane in (a,b,c): pane.rowconfigure(0,weight=1); pane.columnconfigure(0,weight=1)
-        cur=tk.Text(a,wrap='word',font=(self.language_context.target_font if self.language_context else 'Nirmala UI',11),height=6); cy=ttk.Scrollbar(a,orient='vertical',command=cur.yview); cur.configure(yscrollcommand=cy.set); cur.grid(row=0,column=0,sticky='nsew'); cy.grid(row=0,column=1,sticky='ns'); cur.insert('1.0',current); cur.configure(state='disabled')
-        edit=tk.Text(b,wrap='word',font=(self.language_context.target_font if self.language_context else 'Nirmala UI',11),height=8); ey=ttk.Scrollbar(b,orient='vertical',command=edit.yview); edit.configure(yscrollcommand=ey.set); edit.grid(row=0,column=0,sticky='nsew'); ey.grid(row=0,column=1,sticky='ns'); edit.insert('1.0',proposed_text.strip() or current)
+        target_font=self.language_context.target_font if self.language_context else 'Nirmala UI'
+        cur=tk.Text(a,wrap='word',font=(target_font,12),height=6,spacing1=2,spacing3=2,padx=5,pady=4); cy=ttk.Scrollbar(a,orient='vertical',command=cur.yview); cur.configure(yscrollcommand=cy.set); cur.grid(row=0,column=0,sticky='nsew'); cy.grid(row=0,column=1,sticky='ns'); cur.insert('1.0',current); cur.configure(state='disabled')
+        edit=tk.Text(b,wrap='word',font=(target_font,12),height=8); ey=ttk.Scrollbar(b,orient='vertical',command=edit.yview); edit.configure(yscrollcommand=ey.set); edit.grid(row=0,column=0,sticky='nsew'); ey.grid(row=0,column=1,sticky='ns'); edit.insert('1.0',proposed_text.strip() or current); self._configure_grapheme_safe_editor(edit)
         diff=tk.Text(c,wrap='none',font=('Consolas',9),height=7); dy=ttk.Scrollbar(c,orient='vertical',command=diff.yview); dx=ttk.Scrollbar(c,orient='horizontal',command=diff.xview); diff.configure(yscrollcommand=dy.set,xscrollcommand=dx.set); diff.grid(row=0,column=0,sticky='nsew'); dy.grid(row=0,column=1,sticky='ns'); dx.grid(row=1,column=0,sticky='ew'); diff.configure(state='disabled')
         def update_diff(*_):
             new=edit.get('1.0','end-1c').strip(); lines=list(difflib.unified_diff(current.splitlines(),new.splitlines(),fromfile='CURRENT',tofile='PROPOSED',lineterm=''))
@@ -1767,7 +2885,9 @@ class BridgeApp(tk.Tk):
                     native_comment=self.project.sync_comment(ch,vs,matches[0].get('contextId',{}),note,self.settings.reviewer_name,gateway_language_quote=str(matches[0].get('contextId',{}).get('occurrenceNote','')))
             paratext_note=None
             if note:
-                paratext_note=self.project.record_paratext_note(ch,vs,note,self.settings.reviewer_name,selected_text=' '.join(r.proposed_selection_text),note_type=f'AI Bridge {r.tool} Discussion',metadata={'decision':decision,'tool':r.tool,'checkId':r.check_id,'model':str(self.review_meta.get('model') or self.settings.model)})
+                paratext_note=self.project.record_paratext_note(ch,vs,note,self._paratext_note_user(),selected_text=' '.join(r.proposed_selection_text),note_type=f'AI Bridge {r.tool} Discussion',ext_user=EXTERNAL_NOTE_SOURCE,metadata={'decision':decision,'tool':r.tool,'checkId':r.check_id,'model':str(self.review_meta.get('model') or self.settings.model)})
+                if decision in ('needs_discussion','rejected') and self.paratext_live_review_notes_var.get():
+                    self._send_live_paratext_note(note,' '.join(r.proposed_selection_text),reference=f"{self.project.book_id.upper()} {ch}:{vs}")
             p=self.project.record_human_decision(ch,vs,r.check_id,decision,note=note,selection_text=r.proposed_selection_text,selection_ids=r.proposed_selection_ids,tool=r.tool,group_id=r.group_id,model=str(self.review_meta.get('model') or self.settings.model),evidence=r.evidence_used)
             try:
                 metric_name='human_accept' if decision=='accepted' else 'human_reject' if decision=='rejected' else 'human_discussion'
@@ -1814,7 +2934,10 @@ class BridgeApp(tk.Tk):
                     failed.append((ch,vs,str(e))); self._ui_queue.put(('log',f'Book batch {ch}:{vs} failed: {e}'))
             return {'reviewed':done,'failed':failed,'skipped':skipped,'tokens':tokens,'cost':cost,'cancelled':self._cancel_event.is_set()}
         def success(r):
-            self.cancel_batch_btn.configure(state='disabled'); self.usage_var.set(f"Tokens {r['tokens']:,}"); self.cost_var.set(f"Cost ${r.get('cost',0.0):.4f}"); self._refresh_exception_queue(); self._refresh_dashboard_background(); self.notebook.select(self.dashboard_tab)
+            self.cancel_batch_btn.configure(state='disabled'); self.usage_var.set(f"Tokens {r['tokens']:,}"); self.cost_var.set(f"Cost ${r.get('cost',0.0):.4f}")
+            try:self.settings.record_ai_usage(r['tokens'],r.get('cost',0.0)); self._refresh_api_usage_totals()
+            except Exception:pass
+            self._refresh_exception_queue(); self._refresh_dashboard_background(); self.notebook.select(self.dashboard_tab)
             self.review_summary_var.set(f"Book preparation: {len(r['reviewed'])} reviewed · {r['skipped']} unchanged skipped · {len(r['failed'])} failed"+(' · CANCELLED' if r['cancelled'] else ''))
             try: MetricsStore(self.project.companion_dir(),self.project.book_id).event('ai_prepared_batch',checks=sum(x[2] for x in r['reviewed']),issues=sum(x[3] for x in r['reviewed']),skipped=r['skipped'],scope='book',verses=len(r['reviewed']))
             except Exception: pass
@@ -1861,6 +2984,8 @@ class BridgeApp(tk.Tk):
             return done,total_tokens,total_cost
         def success(result):
             done,total,total_cost=result; self.cancel_batch_btn.configure(state='disabled'); self.usage_var.set(f'Tokens {total:,}'); self.cost_var.set(f'Cost ${total_cost:.4f}')
+            try:self.settings.record_ai_usage(total,total_cost); self._refresh_api_usage_totals()
+            except Exception:pass
             problems=sum(x['issues'] for x in done); checks=sum(x['checks'] for x in done); failed=[x['verse'] for x in done if x.get('error') and x.get('error')!='CANCELLED']; skipped=[x['verse'] for x in done if x.get('skipped')]; cancelled=any(x.get('error')=='CANCELLED' for x in done)
             try: MetricsStore(self.project.companion_dir(),self.project.book_id).event('ai_prepared_batch',checks=checks,issues=problems,skipped=len(skipped),scope='chapter',chapter=str(ch),verses=len(done))
             except Exception: pass
@@ -1884,11 +3009,17 @@ class BridgeApp(tk.Tk):
         try: client=self._get_client()
         except Exception as e: messagebox.showerror('API configuration',str(e)); return
         ch=self.chapter_var.get();vs=self.verse_var.get();current=copy.deepcopy(self.session.current); kb=self.kb
+        context=make_request_context(self.project,ch,vs,current)
         # New run always clears stale prepared/evidence panels first.
         self._clear_transient_ai_panels(keep_summary=False)
         def progress(pct,msg): self._job_progress(pct,f'{self.project.book_id.upper()} {ch}:{vs} · {msg}')
         def success(result):
-            proposal,reviewed_alignment,reviews,issues,summary,meta=result
+            req,payload=result
+            if not self.project or not self.session or not request_context_matches(req,self.project,self.chapter_var.get(),self.verse_var.get(),self.session.current):
+                self.log(f'Discarded stale Full Verse Review {req.request_id} for {req.book_id.upper()} {req.chapter}:{req.verse}')
+                self._end_job('AI review discarded — verse/project state changed while AI was working')
+                return
+            proposal,reviewed_alignment,reviews,issues,summary,meta=payload
             self.review_alignment_for_checks=copy.deepcopy(reviewed_alignment)
             self.ai_check_reviews=reviews; self.ai_issues=issues; self.review_meta=meta
             if proposal is not None:
@@ -1906,7 +3037,7 @@ class BridgeApp(tk.Tk):
             self.log(f'AI full preparation {self.project.book_id} {ch}:{vs}: alignment={proposal is not None}; {len(reviews)} tC checks, {len(issues)} QA issues; {meta.get("saved_to","")}')
             self._refresh_exception_queue()
             self._end_job(f'AI Full Verse Review complete · {len(reviews)} checks · {len(issues)} QA issues')
-        self._background('AI Full Verse Review started',lambda:client.prepare_verse_review(self.project,ch,vs,current,kb,progress_callback=progress),success,determinate=True,ai_operation=True)
+        self._background('AI Full Verse Review started',lambda:(context,client.prepare_verse_review(self.project,ch,vs,current,kb,progress_callback=progress)),success,determinate=True,ai_operation=True)
 
 
     def _show_suppressed_findings(self):
@@ -1937,12 +3068,13 @@ class BridgeApp(tk.Tk):
     def _save_settings(self,silent=False):
         try:
             self.settings.model=self.model_var.get(); self.settings.reviewer_name=self.reviewer_name_var.get(); self.settings.set_api_key(self.api_key_var.get(),self.persist_key_var.get())
+            self.settings.set_paratext_project_guid(self._paratext_project_key(),self.paratext_guid_var.get()); self.settings.paratext_username=self.paratext_username_var.get(); self.settings.set_paratext_registration_code(self.paratext_registration_var.get(),self.paratext_persist_var.get())
             self.settings.set_setting('routing_profile',self.routing_profile_var.get())
             try: float(self.cost_warning_var.get())
             except Exception: raise ValueError('Session cost warning must be a number.')
             self.settings.set_setting('cost_warning_usd',self.cost_warning_var.get())
             self._set_api_indicator('unknown','API settings saved · not tested')
-            if not silent: messagebox.showinfo('Settings','Settings saved. Remembered API keys use Windows DPAPI on Windows. Smart routing selects Luna/Terra/Sol by task unless Fixed is selected.')
+            if not silent: messagebox.showinfo('Settings','Settings saved. Remembered OpenAI and Paratext registration credentials use Windows DPAPI on Windows. Smart routing selects Luna/Terra/Sol by task unless Fixed is selected.')
         except Exception as e:
             if silent: raise
             messagebox.showerror('Settings',str(e))
@@ -2068,4 +3200,15 @@ class BridgeApp(tk.Tk):
 
     def _on_close(self):
         if self.session and self.session.dirty and not self._confirm_discard():return
+        self._closing=True
+        self._stop_ai_blink(redraw=False)
+        for aid in (self._paratext_poll_after_id,self._logos_poll_after_id):
+            if aid is not None:
+                try:self.after_cancel(aid)
+                except tk.TclError:pass
+        self._paratext_poll_after_id=None; self._logos_poll_after_id=None
+        try:self._navigation_owner.release()
+        except Exception:pass
+        try:self.logos_connector.close()
+        except Exception:pass
         self.destroy()

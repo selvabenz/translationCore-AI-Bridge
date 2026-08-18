@@ -1,6 +1,6 @@
 #define MyAppName "translationCore AI Bridge"
-#define MyAppVersion "0.7.0"
-#define MyAppExeName "translationCore-AI-Bridge-v0.7.0.exe"
+#define MyAppVersion "0.7.5"
+#define MyAppExeName "translationCore-AI-Bridge-v0.7.5.exe"
 #define MyAppPublisher "translationCore AI Bridge"
 
 [Setup]
@@ -9,13 +9,13 @@ AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppVerName={#MyAppName} {#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-VersionInfoVersion=0.7.0.0
+VersionInfoVersion=0.7.5
 VersionInfoDescription=AI-assisted Bible translation and checking workbench
 DefaultDirName={localappdata}\Programs\translationCore AI Bridge
 DefaultGroupName=translationCore AI Bridge
 DisableProgramGroupPage=yes
 OutputDir=..\dist-installer
-OutputBaseFilename=translationCore-AI-Bridge-v0.7.0-Setup
+OutputBaseFilename=translationCore-AI-Bridge-v0.7.5-Setup
 SetupIconFile=..\assets\app_icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 UninstallDisplayName={#MyAppName} {#MyAppVersion}
@@ -33,11 +33,13 @@ SetupLogging=yes
 UsePreviousAppDir=yes
 
 [Files]
-Source: "..\dist\translationCore-AI-Bridge-v0.7.0\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\dist\translationCore-AI-Bridge-v0.7.5\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\translationCore AI Bridge"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
 Name: "{group}\User Guide"; Filename: "{app}\_internal\userguide\index.html"; Check: FileExists(ExpandConstant('{app}\_internal\userguide\index.html'))
+Name: "{group}\Install Paratext Live Connector"; Filename: "{app}\_internal\paratext_connector\install_paratext_connector.bat"; WorkingDir: "{app}\_internal\paratext_connector"; Check: FileExists(ExpandConstant('{app}\_internal\paratext_connector\install_paratext_connector.bat'))
+Name: "{group}\Uninstall Paratext Live Connector"; Filename: "{app}\_internal\paratext_connector\uninstall_paratext_connector.bat"; WorkingDir: "{app}\_internal\paratext_connector"; Check: FileExists(ExpandConstant('{app}\_internal\paratext_connector\uninstall_paratext_connector.bat'))
 Name: "{autodesktop}\translationCore AI Bridge"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Tasks]

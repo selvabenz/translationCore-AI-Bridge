@@ -37,8 +37,8 @@ class V065PackagingTests(unittest.TestCase):
 
     def test_version_consistency(self):
         version=(ROOT/'VERSION').read_text('utf-8').strip()
-        self.assertEqual(version,'0.7.0')
-        self.assertIn('0.7.0',(ROOT/'installer'/'translationCore-AI-Bridge.iss').read_text('utf-8'))
-        self.assertIn('v0.7.0',(ROOT/'tc_ai_bridge'/'ui.py').read_text('utf-8'))
+        self.assertEqual(version,'0.7.5')
+        self.assertIn('0.7.5',(ROOT/'installer'/'translationCore-AI-Bridge.iss').read_text('utf-8'))
+        self.assertIn('v0.7.5',(ROOT/'tc_ai_bridge'/'ui.py').read_text('utf-8'))
 
 if __name__=='__main__': unittest.main()

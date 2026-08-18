@@ -1,8 +1,8 @@
-# v0.7.0 Production Readiness Matrix
+# v0.7.4 Production Readiness Matrix
 
 Status vocabulary: **Implemented** means the capability exists and has automated coverage in this source release. **Windows certification pending** means the build/test workflow exists but the exact compiled Windows artifact must still execute through the Windows checklist.
 
-| # | Production work | v0.7.0 status | Implementation |
+| # | Production work | v0.7.4 status | Implementation |
 |---|---|---|---|
 | 1 | Native tC comments/discussion sync | Implemented | Reviewer TN/TW discussion/rejection notes can be appended using observed native `checkData/comments` contextId shape; companion decision/audit remains alongside it. |
 | 2 | Windows packaging/certification | Build pipeline implemented; binary certification pending | Icon-bearing PyInstaller one-dir build, Inno Setup installer, Windows 3.11/3.12 CI matrix, certification checklist. |
@@ -25,4 +25,4 @@ Status vocabulary: **Implemented** means the capability exists and has automated
 
 ## Production gate that remains external to this Linux build
 
-The exact v0.7.0 EXE/installer must pass `WINDOWS_CERTIFICATION_CHECKLIST.md` on the supported Windows machines. Until that happens, this release is **source/regression certified, Windows packaging-ready**, not a cryptographically signed or Windows-runtime-certified binary.
+The exact v0.7.4 EXE/installer must pass `WINDOWS_CERTIFICATION_CHECKLIST.md` on the supported Windows machines. Until that happens, this release is **source/regression certified, Windows packaging-ready**, not a cryptographically signed or Windows-runtime-certified binary.

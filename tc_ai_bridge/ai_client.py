@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .alignment_engine import apply_proposal, make_inventory, validate_proposal, validate_preparation_proposal
+from .alignment_reliability import compile_link_proposal
 from .models import AICheckReview, QAIssue, VerseAlignment
 from .tc_project import TranslationCoreProject
 from .model_router import estimate_cost
@@ -93,7 +94,7 @@ class OpenAIResponsesClient:
         headers = {
             'Authorization': f'Bearer {self.api_key}',
             'Content-Type': 'application/json',
-            'User-Agent': 'translationCore-AI-Bridge/0.7.0',
+            'User-Agent': 'translationCore-AI-Bridge/0.7.5',
         }
         body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
         status = 0
@@ -139,7 +140,7 @@ class OpenAIResponsesClient:
         url = f'{self.MODELS_ENDPOINT}/{urllib.parse.quote(self.model, safe="")}'
         req = urllib.request.Request(url, headers={
             'Authorization': f'Bearer {self.api_key}',
-            'User-Agent': 'translationCore-AI-Bridge/0.7.0',
+            'User-Agent': 'translationCore-AI-Bridge/0.7.5',
         }, method='GET')
         try:
             with urllib.request.urlopen(req, timeout=min(self.timeout, 30.0)) as response:
@@ -161,16 +162,43 @@ class OpenAIResponsesClient:
             raise AIError('OpenAI API connection test returned an unexpected model response.')
         return data
 
-    def propose_alignment(self, project: TranslationCoreProject, chapter: str, verse: str, alignment: VerseAlignment) -> dict[str, Any]:
+    def propose_alignment(self, project: TranslationCoreProject, chapter: str, verse: str, alignment: VerseAlignment, mode: str = 'gap_fill') -> dict[str, Any]:
+        """Ask AI only for linguistic token links; compile legal tC groups deterministically.
+
+        mode='gap_fill' protects every existing non-empty alignment group and primarily asks AI
+        about unresolved source/target tokens. mode='audit' is read-only analysis of the whole
+        verse and may propose an alternative complete grouping for human inspection.
+        """
         inv = make_inventory(alignment)
         language = PluginRegistry().detect_project(project, alignment, project.target_verse_text(chapter, verse))
+
+        protected_top: set[str] = set(); protected_bottom: set[str] = set()
+        existing_groups = []
+        for group in alignment.alignments:
+            top_ids=[inv.top_sig_to_id[x.signature] for x in group.top_words if x.signature in inv.top_sig_to_id]
+            bottom_ids=[inv.bottom_sig_to_id[x.signature] for x in group.bottom_words if x.signature in inv.bottom_sig_to_id]
+            if top_ids and bottom_ids:
+                protected_top.update(top_ids); protected_bottom.update(bottom_ids)
+            existing_groups.append({'top_ids':top_ids,'bottom_ids':bottom_ids})
+
+        # Give the model the full verse as context, but explicitly mark unresolved IDs. This is
+        # necessary for target-only gaps that legitimately attach to an existing source group.
+        # The deterministic compiler, not the model, decides whether an extension is safe.
+        top_ids_for_ai = list(inv.top_ids)
+        bottom_ids_for_ai = list(inv.bottom_ids)
+        unresolved_top_ids = [x for x in inv.top_ids if x not in protected_top]
+        unresolved_bottom_ids = [x for x in inv.bottom_ids if x not in protected_bottom]
+
         top = [
-            {'id': tid, 'word': t.word, 'occurrence': t.occurrence, 'occurrences': t.occurrences, 'strong': t.strong, 'lemma': t.lemma, 'morph': t.morph}
-            for tid, t in inv.top_ids.items()
+            {'id': tid, 'word': inv.top_ids[tid].word, 'occurrence': inv.top_ids[tid].occurrence,
+             'occurrences': inv.top_ids[tid].occurrences, 'strong': inv.top_ids[tid].strong,
+             'lemma': inv.top_ids[tid].lemma, 'morph': inv.top_ids[tid].morph}
+            for tid in top_ids_for_ai
         ]
         bottom = [
-            {'id': tid, 'word': t.word, 'occurrence': t.occurrence, 'occurrences': t.occurrences}
-            for tid, t in inv.bottom_ids.items()
+            {'id': tid, 'word': inv.bottom_ids[tid].word, 'occurrence': inv.bottom_ids[tid].occurrence,
+             'occurrences': inv.bottom_ids[tid].occurrences}
+            for tid in bottom_ids_for_ai
         ]
         tc_checks = []
         for e in project.checks_for_verse(chapter, verse):
@@ -181,43 +209,63 @@ class OpenAIResponsesClient:
             })
         input_obj = {
             'reference': f'{project.book_id} {chapter}:{verse}',
-            'tamil_verse': project.target_verse_text(chapter, verse),
+            'mode': mode,
+            'target_verse': project.target_verse_text(chapter, verse),
+            'source_tokens_to_consider': top,
+            'target_tokens_to_consider': bottom,
+            # Backwards-compatible payload aliases retained for existing tests/plugins. In v0.7.4
+            # these arrays contain only the tokens the AI is allowed to consider in gap-fill mode.
             'hebrew_topWords': top,
             'tamil_bottomWords': bottom,
+            'protected_existing_groups': existing_groups if mode == 'gap_fill' else [],
+            'unresolved_source_ids': unresolved_top_ids if mode == 'gap_fill' else list(inv.top_ids),
+            'unresolved_target_ids': unresolved_bottom_ids if mode == 'gap_fill' else list(inv.bottom_ids),
             'translationCore_checks': tc_checks,
             'language_context': language.to_dict(),
-            'target_verse': project.target_verse_text(chapter, verse),
         }
         self.last_privacy_manifest = ai_payload_manifest(input_obj['reference'], input_obj)
         schema = {
-            'type': 'object',
-            'additionalProperties': False,
+            'type': 'object', 'additionalProperties': False,
             'properties': {
-                'groups': {
+                'links': {
                     'type': 'array',
                     'items': {
                         'type': 'object', 'additionalProperties': False,
                         'properties': {
-                            'top_ids': {'type': 'array', 'items': {'type': 'string'}},
-                            'bottom_ids': {'type': 'array', 'items': {'type': 'string'}},
+                            'top_id': {'type': 'string'},
+                            'bottom_id': {'type': 'string'},
                             'confidence': {'type': 'number', 'minimum': 0, 'maximum': 1},
                             'reason': {'type': 'string'},
                         },
-                        'required': ['top_ids', 'bottom_ids', 'confidence', 'reason'],
+                        'required': ['top_id','bottom_id','confidence','reason'],
                     },
                 },
+                'implicit_top_ids': {'type': 'array', 'items': {'type': 'string'}},
+                'target_only_ids': {'type': 'array', 'items': {'type': 'string'}},
                 'review_notes': {'type': 'array', 'items': {'type': 'string'}},
             },
-            'required': ['groups', 'review_notes'],
+            'required': ['links','implicit_top_ids','target_only_ids','review_notes'],
         }
+        scope = (
+            'Existing non-empty alignment groups are protected project evidence. Focus on unresolved IDs. Emit a link involving a protected token only when needed to attach an unresolved token; never bridge/remap two established groups. '
+            'you may restate a protected relationship only if needed for reasoning, but do not propose remapping it.'
+            if mode == 'gap_fill' else
+            'Audit the whole verse. This is read-only: propose the strongest linguistic links for human comparison with existing alignment.'
+        )
         instructions = (
             f'You are a Bible translation word-alignment reviewer for {language.source_name} → {language.target_name}. '
-            f'Connect ONLY the supplied existing {language.target_name} bottomWord IDs to the supplied existing {language.source_name} topWord IDs. '
-            'Never invent, normalize, respell, merge text values, or create tokens. Respect occurrence metadata, source morphology, target morphology/case markers, idioms, implicit grammar, one-to-many and many-to-one alignments. '
-            f'Every {language.source_name} source token should normally appear exactly once. Every {language.target_name} token should appear at most once. Leave bottom_ids empty only when source meaning is genuinely not represented. '
+            'Return INDIVIDUAL linguistic links, not translationCore alignment groups. The application will compile links deterministically into legal 1:1, 1:many, many:1, or many:many groups. '
+            f'Use ONLY the supplied existing {language.source_name} top IDs and {language.target_name} bottom IDs. Never invent, normalize, respell, merge text values, or create tokens. '
+            'It is valid for several source tokens to link to the same target token and for one source token to link to several target tokens; return each linguistic edge separately. '
+            'Confidence belongs to that individual edge. Do not use a weak speculative edge merely to force coverage. Mark a source token in implicit_top_ids only when its meaning is genuinely represented grammatically/implicitly with no separate target token. Mark a target token in target_only_ids only when it is legitimate target-language grammatical/natural material with no separate source token; do not force an artificial source link. '
+            f'{scope} Respect occurrence metadata, morphology, idioms, particles, grammatical encoding, and discontinuous phrases. '
             f'{language.prompt_guidance} English/reference word order is secondary and must not control source-to-target alignment. Return only the schema.'
         )
-        return self._post_structured(instructions, json.dumps(input_obj, ensure_ascii=False), 'tc_alignment_proposal', schema)
+        raw = self._post_structured(instructions, json.dumps(input_obj, ensure_ascii=False), 'tc_alignment_proposal', schema)
+        # Older mocks/cached responses may still use the pre-v0.7.4 groups schema. The compiler
+        # normalizer accepts those for backwards compatibility, while real v0.7.4 requests use links.
+        lock_policy = 'hard' if mode == 'gap_fill' and project.alignment_lock_state(chapter, verse) == 'HARD_LOCK' else 'protected'
+        return compile_link_proposal(alignment, raw, mode=mode, lock_policy=lock_policy)
 
     def run_quality_review(self, project: TranslationCoreProject, chapter: str, verse: str, alignment: VerseAlignment) -> tuple[list[QAIssue], str]:
         inv = make_inventory(alignment)
@@ -297,7 +345,7 @@ class OpenAIResponsesClient:
             summary += f' · {len(suppressed)} low-confidence/duplicate AI finding(s) suppressed by reviewer-noise gate.'
         return issues, summary
 
-    def run_full_review(self, project: TranslationCoreProject, chapter: str, verse: str, alignment: VerseAlignment, knowledge_base=None, progress_callback=None) -> tuple[list[AICheckReview], list[QAIssue], str, dict[str, Any]]:
+    def run_full_review(self, project: TranslationCoreProject, chapter: str, verse: str, alignment: VerseAlignment, knowledge_base=None, progress_callback=None, expected_input_fingerprint: str | None = None) -> tuple[list[AICheckReview], list[QAIssue], str, dict[str, Any]]:
         """AI performs the resource reading + target selection work, human reviews final evidence-backed results."""
         from .knowledge_base import TranslationHelpsKnowledgeBase
 
@@ -482,6 +530,8 @@ class OpenAIResponsesClient:
         summary = str(result.get('summary',''))
         if suppressed_issues:
             summary += f' · {len(suppressed_issues)} low-confidence/duplicate AI finding(s) suppressed.'
+        if expected_input_fingerprint is not None and project.review_input_fingerprint(chapter, verse) != expected_input_fingerprint:
+            raise AIError('Verse/project data changed while AI was working; stale AI review was discarded.')
         saved = project.record_ai_review_result(chapter, verse, {
             'summary': summary,
             'model': self.model,
@@ -505,6 +555,7 @@ class OpenAIResponsesClient:
         It then performs the evidence-backed tC check review and whole-verse QA against that proposed
         alignment. Nothing is written to translationCore alignmentData or checkData.
         """
+        start_input_fingerprint = project.review_input_fingerprint(chapter, verse)
         if progress_callback: progress_callback(5, 'Preparing verse review')
         needs_alignment = bool(alignment.word_bank) or any(g.top_words and not g.bottom_words for g in alignment.alignments)
         proposal: dict[str, Any] | None = None
@@ -513,7 +564,7 @@ class OpenAIResponsesClient:
         first_cost = 0.0
         if needs_alignment:
             if progress_callback: progress_callback(12, 'AI preparing incomplete alignment')
-            proposal = self.propose_alignment(project, chapter, verse, alignment)
+            proposal = self.propose_alignment(project, chapter, verse, alignment, mode='gap_fill')
             # Automatic final-review preparation may fill gaps, but it must never
             # rewrite already-established project alignment relationships.
             validate_preparation_proposal(alignment, proposal)
@@ -523,7 +574,9 @@ class OpenAIResponsesClient:
             if progress_callback: progress_callback(38, 'Alignment proposal validated locally')
         else:
             if progress_callback: progress_callback(38, 'Existing alignment ready')
-        reviews, issues, summary, meta = self.run_full_review(project, chapter, verse, review_alignment, knowledge_base, progress_callback=progress_callback)
+        if project.review_input_fingerprint(chapter, verse) != start_input_fingerprint:
+            raise AIError('Verse/project data changed while AI was preparing alignment; stale result was discarded.')
+        reviews, issues, summary, meta = self.run_full_review(project, chapter, verse, review_alignment, knowledge_base, progress_callback=progress_callback, expected_input_fingerprint=start_input_fingerprint)
         second_usage = self.last_usage.total_tokens
         second_cost = self.last_cost_usd
         total_cost = first_cost + second_cost
@@ -534,6 +587,8 @@ class OpenAIResponsesClient:
         meta['model'] = self.model
         meta['reasoning_effort'] = self.reasoning_effort
         meta['privacy_manifest'] = self.last_privacy_manifest
+        if project.review_input_fingerprint(chapter, verse) != start_input_fingerprint:
+            raise AIError('Verse/project data changed before AI review could be recorded; stale result was discarded.')
         saved = project.record_ai_review_result(chapter, verse, {
             'summary': summary,
             'model': self.model,

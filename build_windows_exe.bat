@@ -23,12 +23,14 @@ if errorlevel 1 (echo Could not create build environment & pause & exit /b 1)
 ".venv-build\Scripts\python.exe" -m pip install --upgrade pyinstaller
 if errorlevel 1 (echo Could not install PyInstaller & pause & exit /b 1)
 ".venv-build\Scripts\python.exe" -m PyInstaller --noconfirm --clean --windowed --onedir ^
-  --name "translationCore-AI-Bridge-v0.7.0" ^
+  --name "translationCore-AI-Bridge-v0.7.5" ^
   --icon "assets\app_icon.ico" ^
   --add-data "assets;assets" ^
   --add-data "userguide;userguide" ^
+  --add-data "paratext_connector;paratext_connector" ^
+  --add-data "logos_connector;logos_connector" ^
   launcher.pyw
 if errorlevel 1 (echo Build failed & pause & exit /b 1)
-echo Build complete. See dist\translationCore-AI-Bridge-v0.7.0\
+echo Build complete. See dist\translationCore-AI-Bridge-v0.7.5\
 echo Run docs\WINDOWS_CERTIFICATION_CHECKLIST.md against this exact build before distribution.
 if /I not "%~1"=="/nopause" pause

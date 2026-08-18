@@ -17,7 +17,7 @@ Optional:
 
 ## Recommended distribution format
 
-Distribute `translationCore-AI-Bridge-v0.7.0-Setup.exe`, not the source ZIP. The installer places the packaged PyInstaller one-directory application under the current user's Local AppData Programs directory, creates Start Menu shortcuts, and supports an optional desktop shortcut.
+Distribute `translationCore-AI-Bridge-v0.7.5-Setup.exe`, not the source ZIP. The installer places the packaged PyInstaller one-directory application under the current user's Local AppData Programs directory, creates Start Menu shortcuts, and supports an optional desktop shortcut.
 
 The installer itself should be built on a Windows build machine using `build_windows_installer.bat` or the included GitHub Actions workflow.
 

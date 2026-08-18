@@ -63,6 +63,10 @@ class AppSettings:
             except Exception:
                 self.data = {}
 
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(self.data, indent=2), encoding='utf-8')
+
     def set_api_key(self, key: str, persist: bool = True) -> None:
         self.data.pop('api_key_dpapi', None)
         self.data['_session_api_key'] = key.strip()
@@ -112,6 +116,96 @@ class AppSettings:
     def reviewer_name(self, value: str) -> None:
         self.data['reviewer_name'] = value.strip() or 'AI Bridge Reviewer'
         self.save_sanitized()
+
+    @property
+    def paratext_username(self) -> str:
+        return str(self.data.get('paratext_username') or '')
+
+    @paratext_username.setter
+    def paratext_username(self, value: str) -> None:
+        self.data['paratext_username'] = str(value or '').strip()
+        self.save_sanitized()
+
+    @property
+    def paratext_project_guid(self) -> str:
+        """Legacy/global Paratext GUID fallback.
+
+        v0.7.4 stores GUIDs per translationCore project so switching projects cannot silently
+        send notes to the previously selected Paratext project. This property is retained for
+        migration and callers that do not yet supply a project key.
+        """
+        return str(self.data.get('paratext_project_guid') or '')
+
+    @paratext_project_guid.setter
+    def paratext_project_guid(self, value: str) -> None:
+        self.data['paratext_project_guid'] = str(value or '').strip()
+        self.save_sanitized()
+
+    def get_paratext_project_guid(self, project_key: str = '') -> str:
+        key = str(project_key or '').strip()
+        mapping = self.data.get('paratext_project_guids')
+        if key and isinstance(mapping, dict):
+            value = str(mapping.get(key) or '').strip()
+            if value:
+                return value
+        return self.paratext_project_guid if not key else ''
+
+    def set_paratext_project_guid(self, project_key: str, value: str) -> None:
+        key = str(project_key or '').strip()
+        if not key:
+            self.paratext_project_guid = value
+            return
+        mapping = self.data.get('paratext_project_guids')
+        if not isinstance(mapping, dict):
+            mapping = {}
+        else:
+            mapping = dict(mapping)
+        clean = str(value or '').strip()
+        if clean:
+            mapping[key] = clean
+        else:
+            mapping.pop(key, None)
+        self.data['paratext_project_guids'] = mapping
+        self.save_sanitized()
+
+    def set_paratext_registration_code(self, code: str, persist: bool = True) -> None:
+        self.data.pop('paratext_registration_code_dpapi', None)
+        self.data['_session_paratext_registration_code'] = str(code or '').strip()
+        if persist and str(code or '').strip() and os.name == 'nt':
+            self.data['paratext_registration_code_dpapi'] = dpapi_protect(str(code).strip())
+        self.save_sanitized()
+
+    def get_paratext_registration_code(self) -> str:
+        session = str(self.data.get('_session_paratext_registration_code', '')).strip()
+        if session:
+            return session
+        enc = str(self.data.get('paratext_registration_code_dpapi', '')).strip()
+        if enc and os.name == 'nt':
+            try:
+                return dpapi_unprotect(enc)
+            except Exception:
+                return ''
+        return ''
+
+    def record_ai_usage(self, total_tokens: int = 0, estimated_cost_usd: float = 0.0) -> None:
+        """Persist Bridge-observed lifetime API usage for this Windows user/settings file."""
+        usage = self.data.get('ai_usage_totals')
+        if not isinstance(usage, dict):
+            usage = {}
+        usage = dict(usage)
+        usage['tokens'] = int(usage.get('tokens', 0) or 0) + max(0, int(total_tokens or 0))
+        usage['estimatedCostUSD'] = float(usage.get('estimatedCostUSD', 0.0) or 0.0) + max(0.0, float(estimated_cost_usd or 0.0))
+        self.data['ai_usage_totals'] = usage
+        self.save_sanitized()
+
+    def get_ai_usage_totals(self) -> dict:
+        usage = self.data.get('ai_usage_totals')
+        if not isinstance(usage, dict):
+            return {'tokens': 0, 'estimatedCostUSD': 0.0}
+        return {
+            'tokens': max(0, int(usage.get('tokens', 0) or 0)),
+            'estimatedCostUSD': max(0.0, float(usage.get('estimatedCostUSD', 0.0) or 0.0)),
+        }
 
 # Production settings are deliberately simple JSON values; secrets remain DPAPI-protected above.
 def _get_setting(self, key, default=None):

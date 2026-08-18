@@ -1,4 +1,4 @@
-# v0.7.0 Responsive Runtime UI Map
+# v0.7.4 Responsive Runtime UI Map
 
 The old screenshot-like title banner has been removed. The OS window title and supplied app icon identify the application without consuming workspace height.
 

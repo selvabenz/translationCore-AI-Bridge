@@ -61,7 +61,7 @@ class V070CoreTests(unittest.TestCase):
             self.assertEqual(ctx.target_id,'ta')
 
     @unittest.skipUnless(ROOT.exists(),'real backend unavailable')
-    def test_paratext_notes_11_comment_does_not_modify_scripture(self):
+    def test_paratext_notes11_comment_does_not_modify_scripture(self):
         projects={p.book_id:p for p in TranslationCoreRoot(ROOT).projects()}
         src=projects.get('rut') or next(iter(projects.values()))
         with tempfile.TemporaryDirectory() as td:
@@ -72,11 +72,14 @@ class V070CoreTests(unittest.TestCase):
             chapter_file=p.book_dir/f'{ch}.json'; before=chapter_file.read_bytes() if chapter_file.exists() else b''
             out=p.record_paratext_note(ch,vs,'Reviewer requests consultant discussion.',username='Reviewer A',selected_text='',note_type='AI Bridge QA Discussion',metadata={'decision':'needs_discussion','severity':'high'})
             info=validate_notes_11(out)
-            self.assertEqual(info['version'],'1.1'); self.assertEqual(info['threads'],1)
+            self.assertEqual(info['format'],'Paratext Notes 1.1'); self.assertEqual(info['comments'],1)
             root=ET.parse(out).getroot(); thread=root.find('thread'); self.assertIsNotNone(thread)
-            self.assertEqual(thread.find('selection').attrib['verseRef'],f'{p.book_id.upper()} {ch}:{vs}')
-            self.assertEqual(thread.find('comment').attrib['user'],'Reviewer A')
-            self.assertIn('Reviewer requests',thread.find('comment').find('content').text)
+            sel=thread.find('selection'); comment=thread.find('comment')
+            self.assertEqual(sel.attrib['verseRef'],f'{p.book_id.upper()} {ch}:{vs}')
+            self.assertGreaterEqual(int(sel.attrib['startPos']),0)
+            self.assertEqual(comment.attrib['user'],'Reviewer A')
+            self.assertEqual(comment.attrib.get('extUser'),'AI Suggestion')
+            self.assertIn('Reviewer requests',comment.findtext('content'))
             if chapter_file.exists(): self.assertEqual(before,chapter_file.read_bytes())
 
     def test_new_official_logo_is_packaged(self):
@@ -110,8 +113,10 @@ class ResponsiveUITests(unittest.TestCase):
         self.assertTrue(app.bind_all('<F8>'))
         self.assertTrue(app.bind_all('<Control-Return>'))
         # Major long-form viewers expose horizontal scrolling callbacks.
-        for w in (app.ai_preview,app.review_detail,app.qa_detail,app.tc_detail,app.kb_detail,app.term_detail,app.psalms_detail,app.log_text):
+        for w in (app.ai_preview,app.qa_detail,app.tc_detail,app.kb_detail,app.term_detail,app.psalms_detail,app.log_text):
             self.assertTrue(str(w.cget('xscrollcommand')))
+        self.assertEqual(str(app.dashboard_scan.cget('wrap')),'word')
+        self.assertEqual(str(app.review_detail.cget('wrap')),'word')
 
     def test_ai_proposal_language_and_confidence_color_tags(self):
         app=self.app

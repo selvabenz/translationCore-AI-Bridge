@@ -42,7 +42,7 @@ if defined LIVE_TC_ROOT (
   )
 
   rem CRITICAL: never run write-capable certification directly on the user's live projects.
-  set "CERT_PARENT=%TEMP%\tc_ai_bridge_v070_cert_!RANDOM!_!RANDOM!"
+  set "CERT_PARENT=%TEMP%\tc_ai_bridge_v073_cert_!RANDOM!_!RANDOM!"
   set "CERT_ROOT=!CERT_PARENT!\translationCore"
 
   if not defined CERT_ROOT (
@@ -96,7 +96,7 @@ if defined LIVE_TC_ROOT (
 )
 
 echo.
-echo Running translationCore AI Bridge v0.7.0 regression tests...
+echo Running translationCore AI Bridge v0.7.5 regression tests...
 ".venv\Scripts\python.exe" "tests\run_windows_certification.py"
 set "TEST_RC=!ERRORLEVEL!"
 
@@ -107,7 +107,7 @@ if defined CERT_PARENT if exist "!CERT_PARENT!" rmdir /s /q "!CERT_PARENT!" >nul
 echo.
 if not "!TEST_RC!"=="0" (
   echo TESTS FAILED
-  echo Your live translationCore projects were NOT used as write targets by v0.7.0 certification.
+  echo Your live translationCore projects were NOT used as write targets by v0.7.5 certification.
   pause
   exit /b !TEST_RC!
 )

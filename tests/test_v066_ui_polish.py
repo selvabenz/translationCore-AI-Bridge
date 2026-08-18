@@ -22,7 +22,7 @@ class V066WindowsPolishTests(unittest.TestCase):
 
     def test_version_is_066(self):
         import tc_ai_bridge
-        self.assertEqual(tc_ai_bridge.__version__,'0.7.0')
+        self.assertEqual(tc_ai_bridge.__version__,'0.7.5')
 
 if __name__=='__main__':
     unittest.main(verbosity=2)
